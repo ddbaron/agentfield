@@ -1,5 +1,5 @@
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, NewType, Optional
 from pydantic import BaseModel, Field, computed_field
 from enum import Enum
 
@@ -7,6 +7,13 @@ from agentfield.openrouter_attribution import (
     apply_litellm_attribution,
     apply_openrouter_usage_accounting,
 )
+
+
+# Provider-neutral opaque identifier for a configured harness profile.  The
+# Python runtime representation is a string so providers can forward it, but
+# the distinct type prevents provider-specific names from becoming part of the
+# AgentField API contract at type-check time.
+ProfileId = NewType("ProfileId", str)
 
 
 class AgentStatus(str, Enum):
@@ -289,6 +296,13 @@ class HarnessConfig(BaseModel):
             'AGENTFIELD_HARNESS_PROVIDER env var when present, else "aforge".'
         ),
     )
+    profile: Optional[ProfileId] = Field(
+        default=None,
+        description=(
+            "Optional opaque provider profile identifier. A selected provider "
+            "must honor it or reject the run before launching its process."
+        ),
+    )
     model: Optional[str] = Field(
         default=None,
         description=(
@@ -337,6 +351,14 @@ class HarnessConfig(BaseModel):
     gemini_bin: str = Field(default="gemini", description="Path to gemini binary.")
     opencode_bin: str = Field(
         default="opencode", description="Path to opencode binary."
+    )
+    opencode_profile_registry: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional OpenCode profile registry for profile-managed runs.",
+    )
+    opencode_profile_file: Optional[str] = Field(
+        default=None,
+        description="Optional JSON file containing OpenCode profile definitions.",
     )
     aforge_bin: str = Field(default="aforge", description="Path to aforge binary.")
     grok_bin: str = Field(

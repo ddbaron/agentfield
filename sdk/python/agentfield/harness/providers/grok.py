@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 
 from agentfield.harness._availability import ensure_cli_available, provider_unavailable
 from agentfield.harness._cli import resolve_model_and_variant, run_cli, strip_ansi
+from agentfield.harness._profiles import reject_profile_for_provider
 from agentfield.harness._result import FailureType, Metrics, RawResult
 
 _JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}\s*$")
@@ -172,6 +173,7 @@ class GrokProvider:
         self._bin = bin_path
 
     async def execute(self, prompt: str, options: dict[str, object]) -> RawResult:
+        reject_profile_for_provider("grok", options)
         ensure_cli_available("grok", self._bin)
 
         root = options.get("project_dir") or options.get("cwd")

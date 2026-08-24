@@ -11,6 +11,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from agentfield.harness._defaults import resolve_harness_provider
+from agentfield.harness._profiles import validate_provider_profile
 from agentfield.harness._result import FailureType, HarnessResult, RawResult
 from agentfield.harness._schema import (
     build_followup_prompt,
@@ -28,6 +29,7 @@ from agentfield.harness._schema import (
 )
 from agentfield.harness.providers._base import HarnessProvider
 from agentfield.harness.providers._factory import build_provider
+from agentfield.types import ProfileId
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +161,7 @@ def _resolve_options(
     if config is not None:
         for field_name in [
             "provider",
+            "profile",
             "model",
             "max_turns",
             "max_budget_usd",
@@ -176,6 +179,8 @@ def _resolve_options(
             "codex_bin",
             "gemini_bin",
             "opencode_bin",
+            "opencode_profile_registry",
+            "opencode_profile_file",
             "grok_bin",
             "schema_max_retries",
             "schema_mode",
@@ -250,6 +255,7 @@ class HarnessRunner:
         *,
         schema: Any = None,
         provider: Optional[str] = None,
+        profile: Optional[ProfileId] = None,
         model: Optional[str] = None,
         max_turns: Optional[int] = None,
         max_budget_usd: Optional[float] = None,
@@ -263,6 +269,7 @@ class HarnessRunner:
     ) -> HarnessResult:
         overrides = {
             "provider": provider,
+            "profile": profile,
             "model": model,
             "max_turns": max_turns,
             "max_budget_usd": max_budget_usd,
@@ -281,6 +288,9 @@ class HarnessRunner:
 
         resolved_cwd = str(options.get("cwd") or ".")
         provider_instance = self._build_provider(str(resolved_provider), options)
+        await validate_provider_profile(
+            str(resolved_provider), provider_instance, options
+        )
 
         # Where the schema output file (.agentfield_output.json) is written and
         # read back. It MUST sit inside the agent's allowed root, or providers

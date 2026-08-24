@@ -68,6 +68,73 @@ in Go, `{ provider: 'codex' }` in TypeScript — and an agent-wide default can b
 set once on the agent's harness config (`HarnessConfig(provider="codex")` in
 Python, `agent.HarnessConfig{Provider: "codex"}` in Go).
 
+## Profile selection
+
+Python exposes an opaque `ProfileId` for integrations that need a provider to
+select a named execution profile:
+
+```python
+from agentfield import Agent, HarnessConfig, ProfileId
+
+app = Agent(
+    "worker",
+    harness_config=HarnessConfig(
+        provider="opencode",
+        profile=ProfileId("reviewer"),
+    ),
+)
+result = await app.harness("Review the current changes.")
+```
+
+AgentField does not interpret profile identifiers or maintain a catalog of
+provider roles. A provider must advertise profile validation and either honor a
+non-empty identifier or reject the call before starting its process. The
+current Python implementation is the only SDK implementation of this contract;
+Go and TypeScript are not profile-capable yet. Calls without a profile retain
+the legacy provider behavior.
+
+The OpenCode adapter resolves definitions from an explicit
+`opencode_profile_registry`/`profile_registry` option, an
+`AGENTFIELD_OPENCODE_PROFILE_FILE` JSON file, an
+`AGENTFIELD_OPENCODE_PROFILES` JSON value, or the existing OpenCode
+`OPENCODE_CONFIG`/`OPENCODE_CONFIG_CONTENT` source. A compact registry looks
+like this:
+
+```json
+{
+  "profiles": {
+    "reviewer": {
+      "mode": "primary",
+      "model": "openrouter/example/reviewer#high",
+      "prompt": "Review the requested changes and report actionable findings.",
+      "permission": {
+        "read": "allow",
+        "edit": "allow",
+        "bash": "ask"
+      }
+    }
+  }
+}
+```
+
+Profile-managed runs materialize a private per-run `opencode.json` with the
+selected profile as both the primary agent and `default_agent`. `ask` effects
+are translated to `deny`; autonomous read/edit/shell actions are explicitly
+configured and `task`/`question` are denied so a headless run never waits for
+interactive input. These OpenCode permissions are an agent policy, not an
+operating-system or container sandbox. The adapter preserves provider
+credentials and other non-policy environment values, but strips AgentField
+control-plane credentials and connection variables from the child session.
+
+The generated `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`, and related policy
+selectors take precedence over caller-provided values. The generated directory
+is removed on success, provider failure, timeout, cancellation, and setup
+failure; a cleanup failure is surfaced as a typed hard failure and that
+directory is never reused. OpenCode capability validation runs against the
+executable itself and requires the supported 1.18+ 1.x `run` surface. The
+adapter intentionally uses direct `opencode run --format json` invocations and
+does not start an OpenCode server or use `--attach`.
+
 ## Install
 
 | Provider | Install | Python extra | Required CLI | Authentication |

@@ -37,6 +37,9 @@ def build_provider(config: "HarnessConfig") -> "HarnessProvider":
 
         return OpenCodeProvider(
             bin_path=getattr(config, "opencode_bin", "opencode"),
+            profile_registry=getattr(config, "opencode_profile_registry", None),
+            profile_file=getattr(config, "opencode_profile_file", None),
+            capability_probe=getattr(config, "opencode_capability_probe", None),
         )
     if provider_name == "grok":
         from agentfield.harness.providers.grok import GrokProvider

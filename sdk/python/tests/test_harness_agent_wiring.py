@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock, patch
 from agentfield.agent import Agent
-from agentfield.types import HarnessConfig
+from agentfield.types import HarnessConfig, ProfileId
 from agentfield.harness._runner import HarnessRunner
 from agentfield.harness._result import HarnessResult
 from agentfield.harness import ProviderHealth
@@ -122,6 +122,28 @@ class TestAgentHarnessMethod:
             assert kwargs["system_prompt"] == "Be helpful"
             assert kwargs["env"] == {"FOO": "bar"}
             assert kwargs["cwd"] == "/tmp"
+
+    @pytest.mark.asyncio
+    async def test_harness_passes_opaque_profile_to_runner(self):
+        agent = Agent(node_id="test-agent", auto_register=False)
+        mock_result = HarnessResult(
+            result="ok",
+            parsed=None,
+            is_error=False,
+            num_turns=1,
+            duration_ms=50,
+            session_id="s",
+            messages=[],
+        )
+
+        with patch.object(
+            HarnessRunner, "run", new_callable=AsyncMock, return_value=mock_result
+        ) as mock_run:
+            await agent.harness(
+                "task", provider="opencode", profile=ProfileId("opaque-profile")
+            )
+
+        assert mock_run.call_args.kwargs["profile"] == "opaque-profile"
 
 
 class TestAgentInitExports:

@@ -138,6 +138,64 @@ class HarnessProviderUnavailable(AgentFieldError):
         super().__init__(message)
 
 
+class HarnessProfileError(AgentFieldError):
+    """Base error for an invalid or unsupported harness profile request.
+
+    Profile identifiers are provider-neutral and opaque.  Providers attach the
+    provider name and a stable machine-readable ``code`` while keeping the
+    human-readable ``action`` specific enough for a caller to correct the
+    request without inspecting provider internals.
+    """
+
+    def __init__(
+        self,
+        provider: str,
+        *,
+        code: str,
+        message: str,
+        action: str,
+        profile: str | None = None,
+    ) -> None:
+        self.provider = provider
+        self.code = code
+        self.action = action
+        self.profile = profile
+        profile_context = f" for profile {profile!r}" if profile is not None else ""
+        super().__init__(
+            f"Harness profile error [{code}] for provider {provider!r}"
+            f"{profile_context}: {message} Action: {action}"
+        )
+
+
+class HarnessProfileUnsupportedError(HarnessProfileError):
+    """A provider cannot honor a non-empty profile identifier."""
+
+    pass
+
+
+class HarnessProfileResolutionError(HarnessProfileError):
+    """A provider could not resolve a profile to an executable definition."""
+
+    pass
+
+
+class HarnessProfileCapabilityError(HarnessProfileError):
+    """The selected provider executable lacks the required profile surface."""
+
+    pass
+
+
+class HarnessProfileCleanupError(HarnessProfileError):
+    """Generated profile configuration cleanup failed.
+
+    The message intentionally contains no filesystem path, environment value,
+    or credential.  The affected directory is discarded and never reused by
+    the provider.
+    """
+
+    pass
+
+
 __all__ = [
     "AgentFieldError",
     "AgentFieldClientError",
@@ -149,4 +207,9 @@ __all__ = [
     "RegistrationError",
     "ValidationError",
     "HarnessProviderUnavailable",
+    "HarnessProfileError",
+    "HarnessProfileUnsupportedError",
+    "HarnessProfileResolutionError",
+    "HarnessProfileCapabilityError",
+    "HarnessProfileCleanupError",
 ]

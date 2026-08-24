@@ -4,6 +4,7 @@ from .router import AgentRouter
 from .types import (
     AIConfig,
     HarnessConfig,
+    ProfileId,
     CompactDiscoveryResponse,
     DiscoveryResponse,
     DiscoveryResult,
@@ -69,6 +70,11 @@ from .exceptions import (
     RegistrationError,
     ValidationError,
     HarnessProviderUnavailable,
+    HarnessProfileError,
+    HarnessProfileUnsupportedError,
+    HarnessProfileResolutionError,
+    HarnessProfileCapabilityError,
+    HarnessProfileCleanupError,
 )
 from .client import ApprovalRequestResponse, ApprovalResult, ApprovalStatusResponse
 from .triggers import EventTrigger, ScheduleTrigger, TriggerContext
@@ -94,8 +100,14 @@ __all__ = [
     "CostTracker",
     "AIConfig",
     "HarnessConfig",
+    "ProfileId",
     "HarnessResult",
     "HarnessProviderUnavailable",
+    "HarnessProfileError",
+    "HarnessProfileUnsupportedError",
+    "HarnessProfileResolutionError",
+    "HarnessProfileCapabilityError",
+    "HarnessProfileCleanupError",
     "MemoryConfig",
     "ReasonerDefinition",
     "SkillDefinition",
