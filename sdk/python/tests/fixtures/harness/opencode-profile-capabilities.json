@@ -1,0 +1,30 @@
+{
+  "contract_version": "v1",
+  "provider": "opencode",
+  "minimum_version": "1.18.0",
+  "run_surface": {
+    "command": ["run", "--format", "json"],
+    "required_flags": ["--agent", "--format", "--dir", "--model", "--variant"]
+  },
+  "profiles": {
+    "fixture-primary": {
+      "mode": "primary",
+      "model": "openrouter/example/fixture#high",
+      "prompt": "Use the fixture profile.",
+      "permission": {
+        "read": "allow",
+        "edit": "allow",
+        "bash": "ask",
+        "task": "ask",
+        "question": "ask"
+      }
+    },
+    "fixture-subagent": {
+      "mode": "subagent"
+    },
+    "fixture-fallback": {
+      "mode": "primary",
+      "fallback": true
+    }
+  }
+}

@@ -65,6 +65,7 @@ from agentfield.types import (
     DiscoveryResult,
     HarnessConfig,
     MemoryConfig,
+    ProfileId,
 )
 from agentfield.multimodal_response import MultimodalResponse
 from agentfield.run_async import run_coroutine, fire_and_forget
@@ -3721,6 +3722,7 @@ class Agent(FastAPI):
         *,
         schema: Any = None,
         provider: Optional[str] = None,
+        profile: Optional[ProfileId] = None,
         model: Optional[str] = None,
         max_turns: Optional[int] = None,
         max_budget_usd: Optional[float] = None,
@@ -3745,6 +3747,9 @@ class Agent(FastAPI):
             provider: Override provider ("aforge", "claude-code", "codex", "gemini",
                 "opencode", "grok"). Omit to use ``AGENTFIELD_HARNESS_PROVIDER``
                 when set, otherwise ``aforge``.
+            profile: Optional opaque provider profile identifier. A provider must
+                honor a non-empty profile or reject the run before launching its
+                process.
             model: Override model identifier. Empty uses the provider's own default.
             max_turns: Maximum agent iterations.
             max_budget_usd: Cost cap in USD.
@@ -3777,6 +3782,7 @@ class Agent(FastAPI):
             prompt,
             schema=schema,
             provider=provider,
+            profile=profile,
             model=model,
             max_turns=max_turns,
             max_budget_usd=max_budget_usd,

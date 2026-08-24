@@ -11,6 +11,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from agentfield.harness._cli import resolve_model_and_variant
+from agentfield.harness._profiles import reject_profile_for_provider
 from agentfield.harness._result import Metrics, RawResult
 from agentfield.exceptions import HarnessProviderUnavailable
 
@@ -69,6 +70,7 @@ class ClaudeCodeProvider:
 
     async def execute(self, prompt: str, options: dict[str, object]) -> RawResult:
         """Execute a prompt via Claude Code SDK."""
+        reject_profile_for_provider("claude-code", options)
         try:
             sdk = _get_claude_sdk()
         except ImportError as exc:

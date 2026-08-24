@@ -12,6 +12,7 @@ from agentfield.harness._cli import (
     strip_ansi,
 )
 from agentfield.harness._availability import ensure_cli_available, provider_unavailable
+from agentfield.harness._profiles import reject_profile_for_provider
 from agentfield.harness._result import FailureType, Metrics, RawResult
 
 
@@ -22,6 +23,7 @@ class GeminiProvider:
         self._bin = bin_path
 
     async def execute(self, prompt: str, options: dict[str, object]) -> RawResult:
+        reject_profile_for_provider("gemini", options)
         ensure_cli_available("gemini", self._bin)
         cmd = [self._bin]
 

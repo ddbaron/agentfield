@@ -11,7 +11,7 @@ import shutil
 import signal
 import subprocess
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
 from agentfield.openrouter_attribution import apply_subprocess_env
 
@@ -268,6 +268,7 @@ async def run_cli(
     timeout: Optional[float] = None,
     idle_seconds: Optional[float] = None,
     input_text: Optional[str] = None,
+    unset_env: Optional[Iterable[str]] = None,
 ) -> Tuple[str, str, int]:
     """Run a CLI command async. Returns (stdout, stderr, returncode).
 
@@ -286,8 +287,16 @@ async def run_cli(
     ``AGENTFIELD_HARNESS_MAX_OUTPUT_BYTES``, default 16MB; <= 0 disables):
     on overflow the head and tail are kept around a truncation marker, so
     the final JSONL result/usage events remain parseable.
+
+    ``unset_env`` removes inherited variables before applying ``env``.  It is
+    intentionally opt-in so existing providers retain their additive
+    environment behavior, while providers that must hide a runtime credential
+    can do so without replacing the entire parent environment.
     """
     merged_env = {**os.environ}
+    if unset_env:
+        for key in unset_env:
+            merged_env.pop(key, None)
     if env:
         merged_env.update(env)
     apply_subprocess_env(merged_env)

@@ -10,6 +10,7 @@ import time
 from typing import ClassVar
 
 from agentfield.harness._availability import ensure_cli_available, provider_unavailable
+from agentfield.harness._profiles import reject_profile_for_provider
 from agentfield.harness._cli import (
     estimate_cli_cost,
     resolve_model_and_variant,
@@ -112,6 +113,7 @@ class AforgeProvider:
         return cls._concurrency_sem
 
     async def execute(self, prompt: str, options: dict[str, object]) -> RawResult:
+        reject_profile_for_provider("aforge", options)
         ensure_cli_available("aforge", self._bin)
         sem = self._get_semaphore()
         logger.debug(
