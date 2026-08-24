@@ -64,6 +64,7 @@ def _mock_fixture_binary_available(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     OpenCodeProvider._concurrency_sem = None
     OpenCodeProvider._shared_data_dir = None
+    OpenCodeProvider._discarded_profile_dirs.clear()
 
 
 def test_profile_id_is_public_and_harness_config_is_typed() -> None:
@@ -212,6 +213,7 @@ async def test_valid_profile_materializes_primary_default_and_headless_policy(
 ):
     log_path = tmp_path / "opencode.jsonl"
     monkeypatch.setenv("AGENTFIELD_API_KEY", "runtime-secret")
+    monkeypatch.setenv("AGENTFIELD_INTERNAL_TOKEN", "internal-token")
     monkeypatch.setenv("AGENTFIELD_TOKEN", "runtime-token")
     monkeypatch.setenv("AGENTFIELD_URL", "http://control-plane")
     monkeypatch.setenv("AGENTFIELD_SERVER", "http://control-plane")
@@ -265,6 +267,7 @@ async def test_valid_profile_materializes_primary_default_and_headless_policy(
     assert env["FAKE_PROVIDER_KEY"] == "scoped-provider-credential"
     assert env["FAKE_INHERITED_VALUE"] == "inherited-value"
     assert "AGENTFIELD_API_KEY" not in env
+    assert "AGENTFIELD_INTERNAL_TOKEN" not in env
     assert "AGENTFIELD_TOKEN" not in env
     assert "AGENTFIELD_URL" not in env
     assert "AGENTFIELD_SERVER" not in env
@@ -353,6 +356,63 @@ async def test_profile_runs_are_concurrent_and_configuration_isolation_is_per_ru
     assert len(run_records) == 2
     assert len(config_dirs) == 2
     assert all(not Path(path).exists() for path in config_dirs)
+    assert OpenCodeProvider._discarded_profile_dirs == set()
+
+
+@pytest.mark.asyncio
+async def test_jsonc_profile_file_preserves_provider_and_resolves_prompt_files(
+    tmp_path: Path,
+):
+    log_path = tmp_path / "jsonc.jsonl"
+    prompt_path = tmp_path / "prompts" / "system.md"
+    prompt_path.parent.mkdir()
+    prompt_path.write_text("fixture instructions", encoding="utf-8")
+    profile_path = tmp_path / "opencode.jsonc"
+    profile_path.write_text(
+        """
+        {
+          // profile source
+          "provider": {
+            "openrouter": {
+              "options": {
+                "apiKey": "provider-secret",
+              },
+            },
+          },
+          "profiles": {
+            "fixture-primary": {
+              "mode": "primary",
+              "prompt": "{file:./prompts/system.md}",
+            },
+          },
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    result = await OpenCodeProvider(str(FAKE_OPENCODE)).execute(
+        "use the file-backed prompt",
+        {
+            "profile": ProfileId("fixture-primary"),
+            "profile_file": str(profile_path),
+            "cwd": str(tmp_path),
+            "env": {"FAKE_OPENCODE_LOG": str(log_path)},
+        },
+    )
+
+    assert result.is_error is False
+    run_record = next(
+        record
+        for record in _run_records(log_path)
+        if record["argv"][0] == "run" and len(record["argv"]) > 2
+    )
+    config = run_record["config"]
+    assert config["provider"] == {
+        "openrouter": {"options": {"apiKey": "provider-secret"}}
+    }
+    assert config["agent"]["fixture-primary"]["prompt"] == (
+        f"{{file:{prompt_path}}}"
+    )
 
 
 @pytest.mark.asyncio

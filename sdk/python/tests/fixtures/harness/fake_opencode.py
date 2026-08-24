@@ -26,6 +26,7 @@ def _record(argv: list[str], config: dict[str, object] | None = None) -> None:
                 "FAKE_PROVIDER_KEY",
                 "FAKE_INHERITED_VALUE",
                 "AGENTFIELD_API_KEY",
+                "AGENTFIELD_INTERNAL_TOKEN",
                 "AGENTFIELD_TOKEN",
                 "AGENTFIELD_URL",
                 "AGENTFIELD_SERVER",

@@ -198,6 +198,7 @@ class _ResolvedProfile:
     agent: dict[str, Any]
     base_config: dict[str, Any]
     source: str
+    source_dir: str | None = None
 
 
 CapabilityProbe = Callable[
@@ -213,6 +214,8 @@ _CAPABILITY_PROBE_TIMEOUT_SECONDS = 5.0
 _SUPPORTED_OPEN_CODE_MAJOR = 1
 _MIN_SUPPORTED_OPEN_CODE_MINOR = 18
 _VERSION_RE = re.compile(r"\bv?(\d+)\.(\d+)(?:\.(\d+))?\b")
+_FILE_REFERENCE_RE = re.compile(r"\{file:([^{}]+)\}")
+_MAX_DISCARDED_PROFILE_DIRS = 128
 
 # These values are configuration selectors, not user credentials.  They are
 # removed from the inherited environment before the generated values are
@@ -237,6 +240,7 @@ _AGENTFIELD_RUNTIME_ENV_VARS = frozenset(
     {
         "AGENTFIELD_API_KEY",
         "AGENTFIELD_API_AUTH_API_KEY",
+        "AGENTFIELD_INTERNAL_TOKEN",
         "AGENTFIELD_TOKEN",
         "AGENTFIELD_URL",
         "AGENTFIELD_BASE_URL",
@@ -374,15 +378,110 @@ def _profile_management_requested(options: Mapping[str, object]) -> bool:
     )
 
 
+def _parse_jsonc(value: str) -> object:
+    if value.startswith("\ufeff"):
+        value = value[1:]
+
+    without_comments: list[str] = []
+    in_string = False
+    escaped = False
+    line_comment = False
+    block_comment = False
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if line_comment:
+            if char in "\r\n":
+                line_comment = False
+                without_comments.append(char)
+            index += 1
+            continue
+        if block_comment:
+            if char == "*" and index + 1 < len(value) and value[index + 1] == "/":
+                block_comment = False
+                without_comments.append(" ")
+                index += 2
+                continue
+            if char in "\r\n":
+                without_comments.append(char)
+            index += 1
+            continue
+        if in_string:
+            without_comments.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            without_comments.append(char)
+            index += 1
+            continue
+        if char == "/" and index + 1 < len(value):
+            next_char = value[index + 1]
+            if next_char == "/":
+                line_comment = True
+                index += 2
+                continue
+            if next_char == "*":
+                block_comment = True
+                index += 2
+                continue
+        without_comments.append(char)
+        index += 1
+
+    if block_comment:
+        raise ValueError("unterminated JSONC comment")
+
+    cleaned: list[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+    source = "".join(without_comments)
+    while index < len(source):
+        char = source[index]
+        if in_string:
+            cleaned.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            cleaned.append(char)
+            index += 1
+            continue
+        if char == ",":
+            next_index = index + 1
+            while next_index < len(source) and source[next_index].isspace():
+                next_index += 1
+            if next_index < len(source) and source[next_index] in "]}":
+                index += 1
+                continue
+        cleaned.append(char)
+        index += 1
+
+    return json.loads("".join(cleaned))
+
+
 def _read_profile_document(
     value: object,
     *,
     source: str,
     profile: ProfileId,
-) -> tuple[dict[str, Any], str]:
+    source_dir: str | None = None,
+) -> tuple[dict[str, Any], str, str | None]:
     if isinstance(value, Mapping):
         try:
-            return copy.deepcopy(dict(value)), source
+            return copy.deepcopy(dict(value)), source, source_dir
         except Exception as exc:
             raise _profile_error(
                 HarnessProfileResolutionError,
@@ -400,12 +499,12 @@ def _read_profile_document(
             profile=profile,
         )
     try:
-        parsed = json.loads(value)
+        parsed = _parse_jsonc(value)
     except (TypeError, ValueError) as exc:
         raise _profile_error(
             HarnessProfileResolutionError,
             code="profile_source_invalid",
-            message="the configured profile source is not valid JSON",
+            message="the configured profile source is not valid JSON or JSONC",
             action="fix the profile source and retry the run",
             profile=profile,
         ) from exc
@@ -417,12 +516,15 @@ def _read_profile_document(
             action="provide a JSON object containing the profile definitions",
             profile=profile,
         )
-    return parsed, source
+    return parsed, source, source_dir
 
 
-def _read_profile_file(path: str, profile: ProfileId) -> tuple[dict[str, Any], str]:
+def _read_profile_file(
+    path: str, profile: ProfileId
+) -> tuple[dict[str, Any], str, str | None]:
+    file_path = os.path.abspath(os.path.expanduser(path))
     try:
-        content = Path(path).read_text(encoding="utf-8")
+        content = Path(file_path).read_text(encoding="utf-8")
     except OSError as exc:
         raise _profile_error(
             HarnessProfileResolutionError,
@@ -431,7 +533,12 @@ def _read_profile_file(path: str, profile: ProfileId) -> tuple[dict[str, Any], s
             action="check the profile file path and permissions",
             profile=profile,
         ) from exc
-    return _read_profile_document(content, source="profile file", profile=profile)
+    return _read_profile_document(
+        content,
+        source="profile file",
+        source_dir=os.path.dirname(file_path),
+        profile=profile,
+    )
 
 
 def _load_profile_document(
@@ -441,10 +548,14 @@ def _load_profile_document(
     *,
     profile_registry: Mapping[str, object] | None = None,
     profile_file: str | None = None,
-) -> tuple[dict[str, Any], str]:
+) -> tuple[dict[str, Any], str, str | None]:
+    inline_source_dir = os.getcwd()
     if profile_registry is not None:
         return _read_profile_document(
-            profile_registry, source="provider profile registry", profile=profile
+            profile_registry,
+            source="provider profile registry",
+            source_dir=inline_source_dir,
+            profile=profile,
         )
 
     for key in (
@@ -456,7 +567,10 @@ def _load_profile_document(
         value = options.get(key)
         if value is not None:
             return _read_profile_document(
-                value, source=f"option {key}", profile=profile
+                value,
+                source=f"option {key}",
+                source_dir=inline_source_dir,
+                profile=profile,
             )
 
     configured_file = profile_file
@@ -476,6 +590,7 @@ def _load_profile_document(
         return _read_profile_document(
             inline_profiles,
             source=_PROFILE_REGISTRY_ENV_VAR,
+            source_dir=inline_source_dir,
             profile=profile,
         )
 
@@ -483,7 +598,10 @@ def _load_profile_document(
         value = options.get(key)
         if value is not None:
             return _read_profile_document(
-                value, source=f"option {key}", profile=profile
+                value,
+                source=f"option {key}",
+                source_dir=inline_source_dir,
+                profile=profile,
             )
 
     config_content = environment.get("OPENCODE_CONFIG_CONTENT")
@@ -491,6 +609,7 @@ def _load_profile_document(
         return _read_profile_document(
             config_content,
             source="OPENCODE_CONFIG_CONTENT",
+            source_dir=inline_source_dir,
             profile=profile,
         )
 
@@ -816,11 +935,35 @@ def _materialized_agent(
     return agent
 
 
+def _resolve_file_references(value: object, source_dir: str | None) -> object:
+    if isinstance(value, str):
+        if source_dir is None:
+            return value
+
+        def replace_reference(match: re.Match[str]) -> str:
+            reference = match.group(1).strip()
+            if not reference or reference.startswith("~") or os.path.isabs(reference):
+                return match.group(0)
+            resolved = os.path.abspath(os.path.join(source_dir, reference))
+            return f"{{file:{resolved}}}"
+
+        return _FILE_REFERENCE_RE.sub(replace_reference, value)
+    if isinstance(value, Mapping):
+        return {
+            key: _resolve_file_references(item, source_dir)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_resolve_file_references(item, source_dir) for item in value]
+    return value
+
+
 def _resolve_profile_document(
     document: Mapping[str, Any],
     source: str,
     profile: ProfileId,
     options: Mapping[str, object],
+    source_dir: str | None = None,
 ) -> _ResolvedProfile:
     profiles, base_config, metadata = _profile_map(document, profile)
     fallback = metadata.get("fallback") or metadata.get("is_fallback") or metadata.get(
@@ -868,7 +1011,10 @@ def _resolve_profile_document(
             profile=profile,
         )
 
-    agent = _materialized_agent(profiles[key], options, profile)
+    agent = {
+        key: _resolve_file_references(value, source_dir)
+        for key, value in _materialized_agent(profiles[key], options, profile).items()
+    }
     base_config = {
         str(config_key): copy.deepcopy(config_value)
         for config_key, config_value in base_config.items()
@@ -890,10 +1036,14 @@ def _resolve_profile_document(
             "is_fallback",
             "used_fallback",
             "contract_version",
-            "provider",
             "minimum_version",
             "run_surface",
         }
+        and (config_key != "provider" or isinstance(config_value, Mapping))
+    }
+    base_config = {
+        config_key: _resolve_file_references(config_value, source_dir)
+        for config_key, config_value in base_config.items()
     }
     base_config.setdefault("$schema", "https://opencode.ai/config.json")
     return _ResolvedProfile(
@@ -901,6 +1051,7 @@ def _resolve_profile_document(
         agent=agent,
         base_config=base_config,
         source=source,
+        source_dir=source_dir,
     )
 
 
@@ -1102,6 +1253,7 @@ class OpenCodeProvider:
     # migrations only run once per process instead of per-call. None means
     # "fresh tempdir per call" (current default).
     _shared_data_dir: ClassVar[Optional[str]] = None
+    _profile_dir_counter: ClassVar[int] = 0
     _discarded_profile_dirs: ClassVar[set[str]] = set()
 
     def __init__(
@@ -1141,14 +1293,16 @@ class OpenCodeProvider:
                 profile=profile,
             )
         environment = _effective_options_env(options)
-        document, source = _load_profile_document(
+        document, source, source_dir = _load_profile_document(
             options,
             environment,
             profile,
             profile_registry=self._profile_registry,
             profile_file=self._profile_file,
         )
-        return _resolve_profile_document(document, source, profile, options)
+        return _resolve_profile_document(
+            document, source, profile, options, source_dir
+        )
 
     def validate_profile(self, options: Mapping[str, object]) -> None:
         """Resolve profiles synchronously before any child process is started."""
@@ -1174,19 +1328,32 @@ class OpenCodeProvider:
 
     @classmethod
     def _remember_discarded_profile_dir(cls, path: str) -> None:
-        cls._discarded_profile_dirs.add(os.path.abspath(path))
+        absolute = os.path.abspath(path)
+        stale = {
+            candidate
+            for candidate in cls._discarded_profile_dirs
+            if not os.path.exists(candidate)
+        }
+        cls._discarded_profile_dirs.difference_update(stale)
+        if (
+            absolute not in cls._discarded_profile_dirs
+            and len(cls._discarded_profile_dirs) >= _MAX_DISCARDED_PROFILE_DIRS
+        ):
+            cls._discarded_profile_dirs.pop()
+        cls._discarded_profile_dirs.add(absolute)
 
     @classmethod
     def _cleanup_profile_dir(cls, path: str) -> None:
-        """Remove a generated config directory and permanently discard its path."""
+        """Remove a generated config directory."""
 
         absolute = os.path.abspath(path)
-        cls._remember_discarded_profile_dir(absolute)
         try:
             shutil.rmtree(absolute)
         except FileNotFoundError:
+            cls._discarded_profile_dirs.discard(absolute)
             return
         except Exception as exc:
+            cls._remember_discarded_profile_dir(absolute)
             raise HarnessProfileCleanupError(
                 "opencode",
                 code="profile_cleanup_failed",
@@ -1199,6 +1366,7 @@ class OpenCodeProvider:
                     "temporary-directory permissions before retrying"
                 ),
             ) from exc
+        cls._discarded_profile_dirs.discard(absolute)
 
     @staticmethod
     def _cleanup_data_dir(path: str) -> None:
@@ -1217,8 +1385,14 @@ class OpenCodeProvider:
     def _materialize_profile(
         self, options: Mapping[str, object], resolved: _ResolvedProfile
     ) -> tuple[str, str, dict[str, str], frozenset[str]]:
+        type(self)._profile_dir_counter += 1
         try:
-            config_dir = tempfile.mkdtemp(prefix=".agentfield-opencode-profile-")
+            config_dir = tempfile.mkdtemp(
+                prefix=(
+                    ".agentfield-opencode-profile-"
+                    f"{os.getpid()}-{type(self)._profile_dir_counter}-"
+                )
+            )
         except Exception as exc:
             raise _profile_error(
                 HarnessProfileResolutionError,
