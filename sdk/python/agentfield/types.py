@@ -1,6 +1,6 @@
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Literal, NewType, Optional
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, field_validator
 from enum import Enum
 
 from agentfield.openrouter_attribution import (
@@ -303,6 +303,16 @@ class HarnessConfig(BaseModel):
             "must honor it or reject the run before launching its process."
         ),
     )
+
+    @field_validator("profile", mode="before")
+    @classmethod
+    def _validate_profile(cls, value: object) -> object:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip() or "\x00" in value:
+            raise ValueError("profile must be a non-empty string without NUL bytes")
+        return value
+
     model: Optional[str] = Field(
         default=None,
         description=(
@@ -361,9 +371,7 @@ class HarnessConfig(BaseModel):
         description="Optional JSON file containing OpenCode profile definitions.",
     )
     aforge_bin: str = Field(default="aforge", description="Path to aforge binary.")
-    grok_bin: str = Field(
-        default="grok", description="Path to Grok Build CLI binary."
-    )
+    grok_bin: str = Field(default="grok", description="Path to Grok Build CLI binary.")
     schema_mode: str = Field(
         default="single",
         description=(

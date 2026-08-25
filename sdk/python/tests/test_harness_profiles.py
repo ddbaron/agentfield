@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from agentfield import HarnessConfig, ProfileId
 from agentfield.exceptions import (
@@ -33,6 +35,9 @@ from agentfield.harness.providers.opencode import (
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "harness"
 FAKE_OPENCODE = FIXTURE_DIR / "fake_opencode.py"
 CAPABILITY_FIXTURE = FIXTURE_DIR / "opencode-profile-capabilities.json"
+CAPABILITY_CHECK = (
+    Path(__file__).parents[1] / "scripts" / "check_opencode_capabilities.py"
+)
 
 
 def _fixture_registry() -> dict[str, Any]:
@@ -75,10 +80,59 @@ def test_profile_id_is_public_and_harness_config_is_typed() -> None:
     assert HarnessConfig(provider="opencode").profile is None
 
 
+@pytest.mark.parametrize("value", [123, "", "   ", "bad\x00profile"])
+def test_harness_config_rejects_invalid_profile_ids(value: object) -> None:
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate({"profile": value})
+
+
+def test_capability_check_uses_executable_version_and_run_surface() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(CAPABILITY_CHECK),
+            "--binary",
+            str(FAKE_OPENCODE),
+            "--expected-version",
+            "1.18.0",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout.strip() == (
+        "OpenCode 1.18.0: run profile capability verified"
+    )
+    assert completed.stderr == ""
+
+
+def test_capability_check_rejects_a_different_pinned_version() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(CAPABILITY_CHECK),
+            "--binary",
+            str(FAKE_OPENCODE),
+            "--expected-version",
+            "1.18.21",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "does not match the pin" in completed.stderr
+    assert "1.18.0" not in completed.stderr
+
+
 def test_profile_is_included_in_runner_option_resolution() -> None:
     config = HarnessConfig(provider="opencode", profile=ProfileId("fixture-primary"))
     runner = HarnessRunner(config)
 
+    assert runner._config is not None
     options = runner._config.model_dump(exclude_none=True)
 
     assert options["profile"] == "fixture-primary"
@@ -90,6 +144,37 @@ def test_profile_capability_protocol_requires_only_validation() -> None:
             _ = options
 
     assert isinstance(ValidatingProvider(), ProfileCapableProvider)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [123, "", "   ", "bad\x00profile"])
+async def test_invalid_direct_profile_never_falls_back_to_profileless_run(
+    tmp_path: Path, value: object
+) -> None:
+    launch_log = tmp_path / "invalid-profile.jsonl"
+    provider = OpenCodeProvider(str(FAKE_OPENCODE))
+
+    with pytest.raises(HarnessProfileResolutionError) as raised:
+        await provider.execute(
+            "must not launch",
+            {
+                "profile": value,
+                "profile_registry": _fixture_registry(),
+                "env": {"FAKE_OPENCODE_LOG": str(launch_log)},
+            },
+        )
+
+    assert raised.value.code == "profile_id_invalid"
+    assert not launch_log.exists()
+
+
+def test_external_profile_source_without_profile_is_profile_managed() -> None:
+    provider = OpenCodeProvider(str(FAKE_OPENCODE))
+
+    with pytest.raises(HarnessProfileResolutionError) as raised:
+        provider.validate_profile({"profile_registry": _fixture_registry()})
+
+    assert raised.value.code == "profile_missing"
 
 
 @pytest.mark.asyncio
@@ -221,12 +306,17 @@ async def test_valid_profile_materializes_primary_default_and_headless_policy(
     monkeypatch.setenv("AGENTFIELD_X25519_PRIVATE_KEY", "private-key")
     monkeypatch.setenv("AGENT_CALLBACK_URL", "http://agent")
     monkeypatch.setenv("FAKE_INHERITED_VALUE", "inherited-value")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "inherited-provider-credential")
+    monkeypatch.setenv("EXA_API_KEY", "inherited-search-credential")
+
+    registry = _fixture_registry()
+    registry["permission"] = {"*": "allow", "bash": "ask"}
 
     raw = await OpenCodeProvider(str(FAKE_OPENCODE)).execute(
         "inspect the fixture",
         {
             "profile": ProfileId("fixture-primary"),
-            "profile_registry": _fixture_registry(),
+            "profile_registry": registry,
             "project_dir": str(tmp_path),
             "env": {
                 "FAKE_OPENCODE_LOG": str(log_path),
@@ -261,11 +351,15 @@ async def test_valid_profile_materializes_primary_default_and_headless_policy(
     assert selected["permission"]["question"] == "deny"
     assert selected["permission"]["external_directory"] == "deny"
     assert selected["permission"]["doom_loop"] == "deny"
+    assert selected["permission"]["*"] == "deny"
     assert not _contains_value(selected["permission"], "ask")
+    assert "permission" not in config
 
     env = run_record["env"]
     assert env["FAKE_PROVIDER_KEY"] == "scoped-provider-credential"
     assert env["FAKE_INHERITED_VALUE"] == "inherited-value"
+    assert env["OPENROUTER_API_KEY"] == "inherited-provider-credential"
+    assert env["EXA_API_KEY"] == "inherited-search-credential"
     assert "AGENTFIELD_API_KEY" not in env
     assert "AGENTFIELD_INTERNAL_TOKEN" not in env
     assert "AGENTFIELD_TOKEN" not in env
@@ -276,6 +370,7 @@ async def test_valid_profile_materializes_primary_default_and_headless_policy(
     assert "AGENT_CALLBACK_URL" not in env
     assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
     assert "OPENCODE_CONFIG_CONTENT" not in env
+    assert env["XDG_DATA_HOME"] != env["OPENCODE_CONFIG_DIR"]
     assert not Path(env["OPENCODE_CONFIG"]).exists()
     assert env["OPENCODE_CONFIG_DIR"] == str(Path(env["OPENCODE_CONFIG"]).parent)
 
@@ -328,6 +423,113 @@ async def test_reserved_config_environment_values_cannot_override_generated_poli
 
 
 @pytest.mark.asyncio
+async def test_profile_tools_and_permission_mode_narrow_provider_owned_policy(
+    tmp_path: Path,
+):
+    log_path = tmp_path / "policy.jsonl"
+    registry = _fixture_registry()
+    registry["profiles"]["fixture-primary"]["tools"] = {
+        "read": True,
+        "edit": True,
+        "bash": True,
+    }
+
+    await OpenCodeProvider(str(FAKE_OPENCODE)).execute(
+        "plan the change",
+        {
+            "profile": ProfileId("fixture-primary"),
+            "profile_registry": registry,
+            "permission_mode": "plan",
+            "tools": ["Read", "Write", "Bash"],
+            "env": {"FAKE_OPENCODE_LOG": str(log_path)},
+        },
+    )
+
+    run_record = next(
+        record
+        for record in _run_records(log_path)
+        if record["argv"][0] == "run" and len(record["argv"]) > 2
+    )
+    permission = run_record["config"]["agent"]["fixture-primary"]["permission"]
+    assert permission["read"] == "allow"
+    assert permission["edit"] == "deny"
+    assert permission["bash"] == "deny"
+    assert permission["*"] == "deny"
+    assert permission["task"] == "deny"
+    assert permission["question"] == "deny"
+    assert not _contains_value(permission, "ask")
+
+
+@pytest.mark.asyncio
+async def test_profile_source_precedence_is_explicit_and_per_run_options_win(
+    tmp_path: Path,
+):
+    log_path = tmp_path / "precedence.jsonl"
+    env_profile_path = tmp_path / "ambient-profile.json"
+    env_registry = _fixture_registry()
+    env_registry["profiles"]["fixture-primary"]["prompt"] = "ambient"
+    env_profile_path.write_text(json.dumps(env_registry), encoding="utf-8")
+
+    constructor_registry = _fixture_registry()
+    constructor_registry["profiles"]["fixture-primary"]["prompt"] = "constructor"
+    option_registry = _fixture_registry()
+    option_registry["profiles"]["fixture-primary"]["prompt"] = "per-run option"
+
+    provider = OpenCodeProvider(
+        str(FAKE_OPENCODE), profile_registry=constructor_registry
+    )
+    await provider.execute(
+        "use the selected source",
+        {
+            "profile": ProfileId("fixture-primary"),
+            "profile_registry": option_registry,
+            "env": {
+                "FAKE_OPENCODE_LOG": str(log_path),
+                "AGENTFIELD_OPENCODE_PROFILE_FILE": str(env_profile_path),
+            },
+        },
+    )
+
+    run_record = next(
+        record
+        for record in _run_records(log_path)
+        if record["argv"][0] == "run" and len(record["argv"]) > 2
+    )
+    assert run_record["config"]["agent"]["fixture-primary"]["prompt"] == (
+        "per-run option"
+    )
+
+
+@pytest.mark.asyncio
+async def test_plain_opencode_config_keeps_profileless_legacy_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    legacy_config = tmp_path / "legacy-opencode.json"
+    legacy_config.write_text(json.dumps({"permission": {"bash": "deny"}}))
+
+    captured: dict[str, Any] = {}
+
+    async def fake_run_cli(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs["env"]
+        return "legacy result", "", 0
+
+    monkeypatch.setattr("agentfield.harness.providers.opencode.run_cli", fake_run_cli)
+
+    await OpenCodeProvider(str(FAKE_OPENCODE)).execute(
+        "legacy run",
+        {
+            "env": {
+                "OPENCODE_CONFIG": str(legacy_config),
+            }
+        },
+    )
+
+    assert "--agent" not in captured["cmd"]
+    assert captured["env"]["OPENCODE_CONFIG"] == str(legacy_config)
+
+
+@pytest.mark.asyncio
 async def test_profile_runs_are_concurrent_and_configuration_isolation_is_per_run(
     tmp_path: Path,
 ):
@@ -361,7 +563,7 @@ async def test_profile_runs_are_concurrent_and_configuration_isolation_is_per_ru
 
 @pytest.mark.asyncio
 async def test_jsonc_profile_file_preserves_provider_and_resolves_prompt_files(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     log_path = tmp_path / "jsonc.jsonl"
     prompt_path = tmp_path / "prompts" / "system.md"
@@ -375,7 +577,7 @@ async def test_jsonc_profile_file_preserves_provider_and_resolves_prompt_files(
           "provider": {
             "openrouter": {
               "options": {
-                "apiKey": "provider-secret",
+                "timeout": 30,
               },
             },
           },
@@ -389,6 +591,7 @@ async def test_jsonc_profile_file_preserves_provider_and_resolves_prompt_files(
         """,
         encoding="utf-8",
     )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "file-profile-provider-credential")
 
     result = await OpenCodeProvider(str(FAKE_OPENCODE)).execute(
         "use the file-backed prompt",
@@ -407,12 +610,36 @@ async def test_jsonc_profile_file_preserves_provider_and_resolves_prompt_files(
         if record["argv"][0] == "run" and len(record["argv"]) > 2
     )
     config = run_record["config"]
-    assert config["provider"] == {
-        "openrouter": {"options": {"apiKey": "provider-secret"}}
-    }
-    assert config["agent"]["fixture-primary"]["prompt"] == (
-        f"{{file:{prompt_path}}}"
+    assert config["provider"] == {"openrouter": {"options": {"timeout": 30}}}
+    assert run_record["env"]["OPENROUTER_API_KEY"] == (
+        "file-profile-provider-credential"
     )
+    assert config["agent"]["fixture-primary"]["prompt"] == (f"{{file:{prompt_path}}}")
+
+
+@pytest.mark.asyncio
+async def test_secret_bearing_profile_config_is_rejected_before_launch(
+    tmp_path: Path,
+):
+    launch_log = tmp_path / "secret-profile.jsonl"
+    registry = _fixture_registry()
+    registry["provider"] = {
+        "openrouter": {"options": {"apiKey": "must-not-be-written"}}
+    }
+
+    with pytest.raises(HarnessProfileResolutionError) as raised:
+        await OpenCodeProvider(str(FAKE_OPENCODE)).execute(
+            "must not launch",
+            {
+                "profile": ProfileId("fixture-primary"),
+                "profile_registry": registry,
+                "env": {"FAKE_OPENCODE_LOG": str(launch_log)},
+            },
+        )
+
+    assert raised.value.code == "profile_secret_in_generated_config"
+    assert "must-not-be-written" not in str(raised.value)
+    assert not launch_log.exists()
 
 
 @pytest.mark.asyncio
@@ -435,9 +662,7 @@ async def test_capability_fixture_rejects_unsupported_version_before_run(
         calls.append(cmd)
         return "unexpected", "", 0
 
-    provider = OpenCodeProvider(
-        str(FAKE_OPENCODE), capability_probe=probe
-    )
+    provider = OpenCodeProvider(str(FAKE_OPENCODE), capability_probe=probe)
     original = __import__(
         "agentfield.harness.providers.opencode", fromlist=["run_cli"]
     ).run_cli
@@ -629,9 +854,7 @@ async def test_runner_preserves_profile_for_schema_retry_provider_contract(
                 if part.endswith(".agentfield_output.json")
             )
             payload = (
-                {"wrong": "first attempt"}
-                if self.calls == 1
-                else {"answer": "ok"}
+                {"wrong": "first attempt"} if self.calls == 1 else {"answer": "ok"}
             )
             Path(output_path).write_text(json.dumps(payload), encoding="utf-8")
             return RawResult(result="ok")

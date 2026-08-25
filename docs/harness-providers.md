@@ -86,19 +86,40 @@ app = Agent(
 result = await app.harness("Review the current changes.")
 ```
 
-AgentField does not interpret profile identifiers or maintain a catalog of
-provider roles. A provider must advertise profile validation and either honor a
-non-empty identifier or reject the call before starting its process. The
-current Python implementation is the only SDK implementation of this contract;
-Go and TypeScript are not profile-capable yet. Calls without a profile retain
-the legacy provider behavior.
+`profile` must be a non-empty string (normally constructed as
+`ProfileId("reviewer")`). An explicitly supplied empty, whitespace-only,
+non-string, or NUL-containing value is an error; it never falls back to the
+profileless path. `profile=None` or omitting `profile` retains the legacy
+provider behavior. AgentField does not interpret profile identifiers or
+maintain a catalog of provider roles. A provider must advertise profile
+validation and either honor a non-empty identifier or reject the call before
+starting its process. The current Python implementation is the only SDK
+implementation of this contract; Go and TypeScript are not profile-capable yet.
 
-The OpenCode adapter resolves definitions from an explicit
-`opencode_profile_registry`/`profile_registry` option, an
-`AGENTFIELD_OPENCODE_PROFILE_FILE` JSON file, an
-`AGENTFIELD_OPENCODE_PROFILES` JSON value, or the existing OpenCode
-`OPENCODE_CONFIG`/`OPENCODE_CONFIG_CONTENT` source. A compact registry looks
-like this:
+### OpenCode profile sources
+
+OpenCode profile management is opt-in. A non-empty `profile`, an explicit
+AgentField profile source, or `AGENTFIELD_OPENCODE_PROFILE_MANAGED=true` enables
+it. A managed run without a profile, or without a definition for that exact
+profile, fails before the OpenCode process starts. Plain `OPENCODE_CONFIG*`
+variables by themselves do not opt a legacy profileless call into profile
+management.
+
+When more than one source is present, the first applicable source below wins:
+
+| Priority | Source | Value |
+| --- | --- | --- |
+| 1 | Per-run registry option | `profile_registry`, `opencode_profile_registry`, `opencode_profiles`, or `profile_definitions` |
+| 2 | Per-run profile file option | `profile_file` or `opencode_profile_file` |
+| 3 | Per-run inline document option | `opencode_config` or `profile_config` |
+| 4 | Provider constructor default | A registry or file supplied when constructing `OpenCodeProvider` |
+| 5 | AgentField environment file | `AGENTFIELD_OPENCODE_PROFILE_FILE` |
+| 6 | AgentField environment registry | `AGENTFIELD_OPENCODE_PROFILES` |
+| 7 | Existing OpenCode configuration | `OPENCODE_CONFIG_CONTENT`, `OPENCODE_CONFIG`, then a file in `OPENCODE_CONFIG_DIR` |
+
+The source is a JSON or JSONC object containing `profiles`, `agent`, or
+`agents`, keyed by the opaque profile identifier. A compact registry looks like
+this:
 
 ```json
 {
@@ -112,28 +133,49 @@ like this:
         "edit": "allow",
         "bash": "ask"
       }
-    }
+      }
   }
 }
 ```
 
-Profile-managed runs materialize a private per-run `opencode.json` with the
-selected profile as both the primary agent and `default_agent`. `ask` effects
-are translated to `deny`; autonomous read/edit/shell actions are explicitly
-configured and `task`/`question` are denied so a headless run never waits for
-interactive input. These OpenCode permissions are an agent policy, not an
-operating-system or container sandbox. The adapter preserves provider
-credentials and other non-policy environment values, but strips AgentField
-control-plane credentials and connection variables from the child session.
+Profile-managed runs materialize a private per-run `opencode.json` and data
+directory. The selected profile is the only generated agent, and its identifier
+is used for both the `--agent` argument and `default_agent`. `project_dir` wins
+over `cwd` for `--dir`. Each run invokes `opencode run --format json` directly;
+the adapter does not start an OpenCode server or use `--attach`.
 
-The generated `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`, and related policy
-selectors take precedence over caller-provided values. The generated directory
-is removed on success, provider failure, timeout, cancellation, and setup
-failure; a cleanup failure is surfaced as a typed hard failure and that
-directory is never reused. OpenCode capability validation runs against the
-executable itself and requires the supported 1.18+ 1.x `run` surface. The
-adapter intentionally uses direct `opencode run --format json` invocations and
-does not start an OpenCode server or use `--attach`.
+The provider owns the headless permission policy. `permission_mode="auto"`
+allows the autonomous actions selected by the profile and `tools` options;
+`permission_mode="plan"` permits read-only actions and denies edits and shell
+execution. A selected profile's `permission` rules are translated from `ask`
+to `deny`, while its `tools` map/list and the caller's `tools` list can only
+narrow access. Unlisted actions are denied. `task`, `question`,
+`external_directory`, and `doom_loop` are reserved denials even if a source
+profile requests `allow`. Top-level OpenCode `permission` and `tools` settings
+are not copied into the generated policy. These permissions are an OpenCode
+agent policy, not an operating-system or container sandbox.
+
+Generated configuration rejects secret-bearing values such as API keys,
+tokens, passwords, credentials, and private keys. Put provider credentials in
+the inherited or per-run environment instead. Non-policy provider credentials
+and other environment values are preserved, while AgentField control-plane
+credentials, connection variables, and profile selectors are removed from the
+child session. Generated configuration and data directories are removed on
+success, provider failure, timeout, cancellation, and setup failure. A cleanup
+failure is surfaced as a typed hard failure, and the affected directory is
+discarded and never reused.
+
+Before launch, the adapter probes the executable's `--version` and
+`run --help` output. The supported surface is OpenCode 1.18 or later within
+major version 1, and it must expose `--agent`, `--format`, `--dir`, `--model`,
+and `--variant`. The cloud image pins the CLI to `opencode-ai@1.18.21`; the
+same check can be reproduced with:
+
+```bash
+npm install -g opencode-ai@1.18.21
+python sdk/python/scripts/check_opencode_capabilities.py \
+  --expected-version 1.18.21
+```
 
 ## Install
 
@@ -143,7 +185,7 @@ does not start an OpenCode server or use `--attach`.
 | `claude-code` | `pip install 'agentfield[harness-claude]'` | `agentfield[harness-claude]` | Bundled by `claude-agent-sdk` | Claude login or `ANTHROPIC_API_KEY` |
 | `codex` | `npm install -g @openai/codex` | `agentfield[harness-codex]` | `codex` | Codex login or `OPENAI_API_KEY` |
 | `gemini` | `npm install -g @google/gemini-cli` | None | `gemini` | Gemini login, `GEMINI_API_KEY`, or `GOOGLE_API_KEY` |
-| `opencode` | `curl -fsSL https://opencode.ai/install \| bash` | `agentfield[harness-opencode]` | `opencode` | Provider credentials configured in OpenCode |
+| `opencode` | `npm install -g opencode-ai@1.18.21` | `agentfield[harness-opencode]` | `opencode` | Provider credentials configured in OpenCode or its environment |
 | `grok` | Install the Grok Build CLI, then `grok login` | None | `grok` | `XAI_API_KEY` |
 
 Install every Python wrapper with:

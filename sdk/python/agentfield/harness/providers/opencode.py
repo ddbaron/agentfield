@@ -27,7 +27,7 @@ from agentfield.harness._cli import (
     strip_ansi,
 )
 from agentfield.harness._availability import ensure_cli_available, provider_unavailable
-from agentfield.harness._profiles import normalize_profile
+from agentfield.harness._profiles import validate_profile_id
 from agentfield.harness._result import FailureType, Metrics, RawResult
 from agentfield.exceptions import (
     HarnessProfileCapabilityError,
@@ -210,6 +210,14 @@ _PROFILE_CONFIG_FILENAME = "opencode.json"
 _PROFILE_MANAGED_ENV_VAR = "AGENTFIELD_OPENCODE_PROFILE_MANAGED"
 _PROFILE_REGISTRY_ENV_VAR = "AGENTFIELD_OPENCODE_PROFILES"
 _PROFILE_FILE_ENV_VAR = "AGENTFIELD_OPENCODE_PROFILE_FILE"
+_PROFILE_REGISTRY_OPTION_KEYS = (
+    "profile_registry",
+    "opencode_profile_registry",
+    "opencode_profiles",
+    "profile_definitions",
+)
+_PROFILE_FILE_OPTION_KEYS = ("profile_file", "opencode_profile_file")
+_PROFILE_INLINE_OPTION_KEYS = ("opencode_config", "profile_config")
 _CAPABILITY_PROBE_TIMEOUT_SECONDS = 5.0
 _SUPPORTED_OPEN_CODE_MAJOR = 1
 _MIN_SUPPORTED_OPEN_CODE_MINOR = 18
@@ -268,8 +276,13 @@ _AGENTFIELD_RUNTIME_ENV_VARS = frozenset(
         "AGENTFIELD_CALLBACK_URL",
     }
 )
-_PROFILE_UNSET_ENV_VARS = frozenset(
-    _PROFILE_POLICY_ENV_VARS | _AGENTFIELD_RUNTIME_ENV_VARS
+# Generated OpenCode configuration must never contain credentials. Provider
+# credentials belong in the inherited/scoped environment, where OpenCode can
+# consume them without AgentField serializing secrets into a temporary file.
+_SECRET_CONFIG_KEY_RE = re.compile(
+    r"(?:^|_)(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|"
+    r"password|credential|private[_-]?key|authorization)(?:$|_)",
+    re.IGNORECASE,
 )
 
 _AUTONOMOUS_PERMISSION_ACTIONS = (
@@ -320,6 +333,7 @@ _PROFILE_METADATA_KEYS = {
     "config",
     "agent",
     "permissions",
+    "permission_mode",
     "disable",
     "disabled",
     "type",
@@ -366,16 +380,68 @@ def _profile_mode_enabled(environment: Mapping[str, str]) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _profile_management_requested(options: Mapping[str, object]) -> bool:
+def _profile_management_requested(
+    options: Mapping[str, object],
+    *,
+    profile_registry: Mapping[str, object] | None = None,
+    profile_file: str | None = None,
+) -> bool:
     """Whether this OpenCode request opts into profile-managed execution."""
 
-    if normalize_profile(options.get("profile")) is not None:
+    # Any non-None direct value is an intentional profile request, including an
+    # invalid value.  The validator must see invalid values instead of allowing
+    # them to fall through to the legacy profileless path.
+    if options.get("profile") is not None:
+        return True
+    if profile_registry is not None or profile_file is not None:
+        return True
+    if any(
+        key in options and options[key] is not None
+        for key in (
+            *_PROFILE_REGISTRY_OPTION_KEYS,
+            *_PROFILE_FILE_OPTION_KEYS,
+            *_PROFILE_INLINE_OPTION_KEYS,
+        )
+    ):
         return True
     environment = _effective_options_env(options)
     return _profile_mode_enabled(environment) or any(
         bool(environment.get(name, "").strip())
         for name in (_PROFILE_REGISTRY_ENV_VAR, _PROFILE_FILE_ENV_VAR)
     )
+
+
+def _profile_source_has_secrets(value: object) -> bool:
+    """Return whether a generated-config value contains a secret-like key."""
+
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if isinstance(key, str) and _SECRET_CONFIG_KEY_RE.search(
+                re.sub(r"[^A-Za-z0-9_-]", "_", key)
+            ):
+                return True
+            if _profile_source_has_secrets(item):
+                return True
+    elif isinstance(value, list):
+        return any(_profile_source_has_secrets(item) for item in value)
+    return False
+
+
+def _profile_runtime_env_keys(environment: Mapping[str, str]) -> frozenset[str]:
+    """Build the denylist for AgentField runtime state in child processes."""
+
+    # Keep this prefix-based in addition to the known list: newly introduced
+    # AgentField credentials must not become child-session credentials merely
+    # because this adapter has not been updated yet. Provider credentials such
+    # as OPENROUTER_API_KEY remain untouched.
+    runtime = set(_AGENTFIELD_RUNTIME_ENV_VARS)
+    runtime.update(key for key in environment if key.startswith("AGENTFIELD_"))
+    runtime.update(
+        key
+        for key in environment
+        if key == "AGENT_CALLBACK_URL" or key.startswith("AGENTFIELD_CALLBACK_")
+    )
+    return frozenset(runtime)
 
 
 def _parse_jsonc(value: str) -> object:
@@ -550,20 +616,10 @@ def _load_profile_document(
     profile_file: str | None = None,
 ) -> tuple[dict[str, Any], str, str | None]:
     inline_source_dir = os.getcwd()
-    if profile_registry is not None:
-        return _read_profile_document(
-            profile_registry,
-            source="provider profile registry",
-            source_dir=inline_source_dir,
-            profile=profile,
-        )
-
-    for key in (
-        "opencode_profile_registry",
-        "profile_registry",
-        "opencode_profiles",
-        "profile_definitions",
-    ):
+    # Explicit per-run options always win.  This ordering also lets a call
+    # override an agent-wide provider default without accidentally selecting a
+    # stale constructor-captured registry.
+    for key in _PROFILE_REGISTRY_OPTION_KEYS:
         value = options.get(key)
         if value is not None:
             return _read_profile_document(
@@ -573,15 +629,52 @@ def _load_profile_document(
                 profile=profile,
             )
 
-    configured_file = profile_file
-    if not configured_file:
-        for key in ("opencode_profile_file", "profile_file"):
-            value = options.get(key)
-            if isinstance(value, str) and value.strip():
-                configured_file = value
-                break
-    if not configured_file:
-        configured_file = environment.get(_PROFILE_FILE_ENV_VAR)
+    for key in _PROFILE_FILE_OPTION_KEYS:
+        if key not in options or options[key] is None:
+            continue
+        value = options[key]
+        if not isinstance(value, str) or not value.strip():
+            raise _profile_error(
+                HarnessProfileResolutionError,
+                code="profile_source_invalid",
+                message="the configured profile file option must be a non-empty path",
+                action="provide a readable JSON or JSONC profile file path",
+                profile=profile,
+            )
+        return _read_profile_file(value, profile)
+
+    for key in _PROFILE_INLINE_OPTION_KEYS:
+        value = options.get(key)
+        if value is not None:
+            return _read_profile_document(
+                value,
+                source=f"option {key}",
+                source_dir=inline_source_dir,
+                profile=profile,
+            )
+
+    # Constructor values are provider defaults and therefore have lower
+    # precedence than a call/agent option, but higher precedence than ambient
+    # environment configuration.
+    if profile_registry is not None:
+        return _read_profile_document(
+            profile_registry,
+            source="provider profile registry",
+            source_dir=inline_source_dir,
+            profile=profile,
+        )
+    if profile_file is not None:
+        if not isinstance(profile_file, str) or not profile_file.strip():
+            raise _profile_error(
+                HarnessProfileResolutionError,
+                code="profile_source_invalid",
+                message="the configured provider profile file must be a non-empty path",
+                action="provide a readable JSON or JSONC profile file path",
+                profile=profile,
+            )
+        return _read_profile_file(profile_file, profile)
+
+    configured_file = environment.get(_PROFILE_FILE_ENV_VAR)
     if isinstance(configured_file, str) and configured_file.strip():
         return _read_profile_file(configured_file, profile)
 
@@ -593,16 +686,6 @@ def _load_profile_document(
             source_dir=inline_source_dir,
             profile=profile,
         )
-
-    for key in ("opencode_config", "profile_config"):
-        value = options.get(key)
-        if value is not None:
-            return _read_profile_document(
-                value,
-                source=f"option {key}",
-                source_dir=inline_source_dir,
-                profile=profile,
-            )
 
     config_content = environment.get("OPENCODE_CONFIG_CONTENT")
     if isinstance(config_content, str) and config_content.strip():
@@ -647,6 +730,7 @@ def _looks_like_agent_config(value: Mapping[str, object]) -> bool:
             "mode",
             "permission",
             "permissions",
+            "permission_mode",
             "tools",
             "description",
             "steps",
@@ -711,9 +795,7 @@ def _profile_map(
     return profiles, base_config, metadata
 
 
-def _unwrap_profile_entry(
-    raw_entry: object, profile: ProfileId
-) -> dict[str, Any]:
+def _unwrap_profile_entry(raw_entry: object, profile: ProfileId) -> dict[str, Any]:
     if not isinstance(raw_entry, Mapping):
         raise _profile_error(
             HarnessProfileResolutionError,
@@ -726,9 +808,7 @@ def _unwrap_profile_entry(
     nested = entry.get("config")
     if isinstance(nested, Mapping):
         wrapper = {
-            key: value
-            for key, value in entry.items()
-            if key not in {"config", "agent"}
+            key: value for key, value in entry.items() if key not in {"config", "agent"}
         }
         result = copy.deepcopy(dict(nested))
         for key, value in wrapper.items():
@@ -760,8 +840,7 @@ def _permission_effect(value: object, profile: ProfileId) -> object:
         )
     if isinstance(value, Mapping):
         return {
-            str(key): _permission_effect(item, profile)
-            for key, item in value.items()
+            str(key): _permission_effect(item, profile) for key, item in value.items()
         }
     raise _profile_error(
         HarnessProfileResolutionError,
@@ -775,8 +854,7 @@ def _permission_effect(value: object, profile: ProfileId) -> object:
 def _permission_rules(value: object, profile: ProfileId) -> dict[str, object]:
     if isinstance(value, Mapping):
         return {
-            str(key): _permission_effect(item, profile)
-            for key, item in value.items()
+            str(key): _permission_effect(item, profile) for key, item in value.items()
         }
     if not isinstance(value, list):
         raise _profile_error(
@@ -818,8 +896,7 @@ def _permission_rules(value: object, profile: ProfileId) -> dict[str, object]:
             existing_rules: dict[str, object] = {"*": existing}
         elif isinstance(existing, dict):
             existing_rules = {
-                str(rule_key): rule_value
-                for rule_key, rule_value in existing.items()
+                str(rule_key): rule_value for rule_key, rule_value in existing.items()
             }
         else:
             existing_rules = {}
@@ -831,39 +908,79 @@ def _permission_rules(value: object, profile: ProfileId) -> dict[str, object]:
 def _translated_permissions(
     entry: Mapping[str, Any], options: Mapping[str, object], profile: ProfileId
 ) -> dict[str, object]:
-    permission_mode = str(options.get("permission_mode") or "auto").strip().lower()
-    if permission_mode == "plan":
-        permissions: dict[str, object] = {
-            action: ("allow" if action in _READ_ONLY_PERMISSION_ACTIONS else "deny")
-            for action in _AUTONOMOUS_PERMISSION_ACTIONS
-        }
-    else:
-        permissions = {action: "allow" for action in _AUTONOMOUS_PERMISSION_ACTIONS}
+    configured_mode = options.get("permission_mode")
+    if configured_mode is None:
+        configured_mode = entry.get("permission_mode")
+    permission_mode = str(configured_mode or "auto").strip().lower()
+    if permission_mode not in {"auto", "plan"}:
+        raise _profile_error(
+            HarnessProfileResolutionError,
+            code="permission_mode_invalid",
+            message="profile-managed OpenCode permission_mode must be auto or plan",
+            action="set permission_mode to 'auto' or 'plan'",
+            profile=profile,
+        )
 
-    configured_tools = options.get("tools")
-    if isinstance(configured_tools, list):
+    # The wildcard is deliberately first so the explicit policy below wins for
+    # known actions, while unknown OpenCode actions remain denied rather than
+    # falling back to an interactive prompt.
+    permissions: dict[str, object] = {"*": "deny"}
+    if permission_mode == "plan":
+        permissions.update(
+            {
+                action: ("allow" if action in _READ_ONLY_PERMISSION_ACTIONS else "deny")
+                for action in _AUTONOMOUS_PERMISSION_ACTIONS
+            }
+        )
+    else:
+        permissions.update(
+            {action: "allow" for action in _AUTONOMOUS_PERMISSION_ACTIONS}
+        )
+
+    configured_permission = entry.get("permission", entry.get("permissions"))
+    if configured_permission is not None:
+        profile_rules = _permission_rules(configured_permission, profile)
+        permissions.update(profile_rules)
+    else:
+        profile_rules = {}
+
+    profile_tools = entry.get("tools")
+    if isinstance(profile_tools, (list, tuple, set, frozenset)):
         enabled = {
-            _TOOL_ACTIONS.get(str(tool).strip().lower())
-            for tool in configured_tools
+            _TOOL_ACTIONS.get(str(tool).strip().lower()) for tool in profile_tools
         }
         for action in _AUTONOMOUS_PERMISSION_ACTIONS:
             if action not in enabled:
                 permissions[action] = "deny"
 
-    configured_permission = entry.get("permission", entry.get("permissions"))
-    if configured_permission is not None:
-        permissions.update(_permission_rules(configured_permission, profile))
-
+    # A profile permission rule is stronger than a tools allowlist. A profile's
+    # ``tools`` map may grant an otherwise-default action, but it cannot replace
+    # an explicit granular rule (including resource-scoped rules).
     configured_tools_map = entry.get("tools")
     if isinstance(configured_tools_map, Mapping):
         for tool, enabled in configured_tools_map.items():
             action = _TOOL_ACTIONS.get(str(tool).strip().lower())
-            if action is None:
+            if action is None or (bool(enabled) and action in profile_rules):
                 continue
             permissions[action] = "allow" if bool(enabled) else "deny"
 
+    configured_tools = options.get("tools")
+    if isinstance(configured_tools, (list, tuple, set, frozenset)):
+        enabled = {
+            _TOOL_ACTIONS.get(str(tool).strip().lower()) for tool in configured_tools
+        }
+        for action in _AUTONOMOUS_PERMISSION_ACTIONS:
+            if action not in enabled:
+                permissions[action] = "deny"
+
     # Profile-managed runs never wait for an interactive answer.  task and
     # question are explicitly denied even if a source profile requested ask.
+    # Keep plan mode read-only even if a source profile requested edit access.
+    if permission_mode == "plan":
+        for action in _AUTONOMOUS_PERMISSION_ACTIONS:
+            if action not in _READ_ONLY_PERMISSION_ACTIONS:
+                permissions[action] = "deny"
+    permissions["*"] = "deny"
     for action in _HEADLESS_DENIED_ACTIONS:
         permissions[action] = "deny"
     return permissions
@@ -875,21 +992,22 @@ def _materialized_agent(
     entry = _unwrap_profile_entry(raw_entry, profile)
     source = str(entry.get("source", "")).strip().lower()
     resolution = str(entry.get("resolution", "")).strip().lower()
-    if any(
-        bool(entry.get(key))
-        for key in ("fallback", "is_fallback", "used_fallback")
-    ) or source == "fallback" or resolution in {
-        "fallback",
-        "default",
-    }:
+    if (
+        any(
+            bool(entry.get(key)) for key in ("fallback", "is_fallback", "used_fallback")
+        )
+        or source == "fallback"
+        or resolution
+        in {
+            "fallback",
+            "default",
+        }
+    ):
         raise _profile_error(
             HarnessProfileResolutionError,
             code="profile_fallback_selected",
             message="profile resolution selected a fallback definition",
-            action=(
-                "select an exact primary profile; fallback resolution is not "
-                "allowed"
-            ),
+            action="select an exact primary profile; fallback resolution is not allowed",
             profile=profile,
         )
 
@@ -898,10 +1016,7 @@ def _materialized_agent(
         raise _profile_error(
             HarnessProfileResolutionError,
             code="profile_subagent",
-            message=(
-                "the selected profile is a subagent and cannot be the primary "
-                "run agent"
-            ),
+            message="the selected profile is a subagent and cannot be the primary run agent",
             action="select a profile with mode primary or all",
             profile=profile,
         )
@@ -966,8 +1081,10 @@ def _resolve_profile_document(
     source_dir: str | None = None,
 ) -> _ResolvedProfile:
     profiles, base_config, metadata = _profile_map(document, profile)
-    fallback = metadata.get("fallback") or metadata.get("is_fallback") or metadata.get(
-        "used_fallback"
+    fallback = (
+        metadata.get("fallback")
+        or metadata.get("is_fallback")
+        or metadata.get("used_fallback")
     )
     selected = metadata.get(
         "selected_profile",
@@ -978,10 +1095,7 @@ def _resolve_profile_document(
             HarnessProfileResolutionError,
             code="profile_fallback_selected",
             message="profile resolution selected a fallback definition",
-            action=(
-                "select an exact primary profile; fallback resolution is not "
-                "allowed"
-            ),
+            action="select an exact primary profile; fallback resolution is not allowed",
             profile=profile,
         )
     if isinstance(selected, str) and selected and selected != str(profile):
@@ -989,10 +1103,7 @@ def _resolve_profile_document(
             HarnessProfileResolutionError,
             code="profile_not_selected",
             message="the requested profile was not the exact resolved selection",
-            action=(
-                "disable fallback selection and select the requested profile "
-                "exactly"
-            ),
+            action="disable fallback selection and select the requested profile exactly",
             profile=profile,
         )
 
@@ -1003,10 +1114,7 @@ def _resolve_profile_document(
         raise _profile_error(
             HarnessProfileResolutionError,
             code="profile_unknown",
-            message=(
-                "no exact profile definition was found "
-                f"(available: {available_text})"
-            ),
+            message=f"no exact profile definition was found (available: {available_text})",
             action="register the requested profile before starting the run",
             profile=profile,
         )
@@ -1276,22 +1384,10 @@ class OpenCodeProvider:
         return cls._concurrency_sem
 
     def _resolve_profile(self, options: Mapping[str, object]) -> _ResolvedProfile:
-        profile = normalize_profile(options.get("profile"))
-        if profile is None:
-            raise _profile_error(
-                HarnessProfileResolutionError,
-                code="profile_missing",
-                message="profile-managed OpenCode mode did not receive a profile",
-                action="provide a non-empty opaque profile identifier",
-            )
-        if "\x00" in str(profile):
-            raise _profile_error(
-                HarnessProfileResolutionError,
-                code="profile_id_invalid",
-                message="the profile identifier contains a NUL character",
-                action="provide a valid opaque profile identifier",
-                profile=profile,
-            )
+        profile = validate_profile_id(
+            options.get("profile"), provider="opencode", required=True
+        )
+        assert profile is not None
         environment = _effective_options_env(options)
         document, source, source_dir = _load_profile_document(
             options,
@@ -1300,23 +1396,21 @@ class OpenCodeProvider:
             profile_registry=self._profile_registry,
             profile_file=self._profile_file,
         )
-        return _resolve_profile_document(
-            document, source, profile, options, source_dir
-        )
+        return _resolve_profile_document(document, source, profile, options, source_dir)
 
     def validate_profile(self, options: Mapping[str, object]) -> None:
         """Resolve profiles synchronously before any child process is started."""
 
-        if not _profile_management_requested(options):
+        if not _profile_management_requested(
+            options,
+            profile_registry=self._profile_registry,
+            profile_file=self._profile_file,
+        ):
             return
-        profile = normalize_profile(options.get("profile"))
-        if profile is None:
-            raise _profile_error(
-                HarnessProfileResolutionError,
-                code="profile_missing",
-                message="profile-managed OpenCode mode did not receive a profile",
-                action="provide a non-empty opaque profile identifier",
-            )
+        profile = validate_profile_id(
+            options.get("profile"), provider="opencode", required=True
+        )
+        assert profile is not None
         resolved = self._resolve_profile(options)
         if isinstance(options, dict):
             options["_opencode_resolved_profile"] = resolved
@@ -1324,7 +1418,11 @@ class OpenCodeProvider:
     def profile_mode_requested(self, options: Mapping[str, object]) -> bool:
         """Expose provider-owned mode detection to the generic runner."""
 
-        return _profile_management_requested(options)
+        return _profile_management_requested(
+            options,
+            profile_registry=self._profile_registry,
+            profile_file=self._profile_file,
+        )
 
     @classmethod
     def _remember_discarded_profile_dir(cls, path: str) -> None:
@@ -1423,6 +1521,20 @@ class OpenCodeProvider:
         payload["default_agent"] = str(resolved.profile_id)
 
         try:
+            if _profile_source_has_secrets(payload):
+                raise _profile_error(
+                    HarnessProfileResolutionError,
+                    code="profile_secret_in_generated_config",
+                    message=(
+                        "the selected profile contains a secret-bearing config "
+                        "value and cannot be materialized"
+                    ),
+                    action=(
+                        "remove credentials from the profile source and provide "
+                        "them through the provider environment"
+                    ),
+                    profile=resolved.profile_id,
+                )
             serialized = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
             Path(config_path).write_text(serialized, encoding="utf-8")
             os.chmod(config_path, 0o600)
@@ -1441,13 +1553,15 @@ class OpenCodeProvider:
                 profile=resolved.profile_id,
             ) from exc
 
+        environment = _effective_options_env(options)
+        unset_env = _PROFILE_POLICY_ENV_VARS | _profile_runtime_env_keys(environment)
         env = _string_env_overrides(options)
-        for key in _AGENTFIELD_RUNTIME_ENV_VARS | _PROFILE_POLICY_ENV_VARS:
+        for key in unset_env:
             env.pop(key, None)
         env["OPENCODE_CONFIG_DIR"] = config_dir
         env["OPENCODE_CONFIG"] = config_path
         env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
-        return config_dir, config_path, env, _PROFILE_UNSET_ENV_VARS
+        return config_dir, config_path, env, frozenset(unset_env)
 
     async def _ensure_profile_capabilities(
         self,
@@ -1474,10 +1588,7 @@ class OpenCodeProvider:
             raise HarnessProfileCapabilityError(
                 "opencode",
                 code="opencode_version_unsupported",
-                message=(
-                    "the executable capability fixture reported an unsupported "
-                    "version"
-                ),
+                message="the executable capability fixture reported an unsupported version",
                 action="use OpenCode 1.18.x or a later supported 1.x release",
             )
         if not result.supports_profiles or not result.supports_agent_selection:
@@ -1504,15 +1615,16 @@ class OpenCodeProvider:
                     "the executable lacks required profile capabilities: "
                     + ", ".join(missing_capabilities)
                 ),
-                action=(
-                    "use an OpenCode executable with the complete profile run "
-                    "surface"
-                ),
+                action="use an OpenCode executable with the complete profile run surface",
             )
         return result
 
     async def execute(self, prompt: str, options: dict[str, object]) -> RawResult:
-        if _profile_management_requested(options):
+        if _profile_management_requested(
+            options,
+            profile_registry=self._profile_registry,
+            profile_file=self._profile_file,
+        ):
             self.validate_profile(options)
         ensure_cli_available("opencode", self._bin)
         sem = self._get_semaphore()
@@ -1549,21 +1661,12 @@ class OpenCodeProvider:
             config_dir, _config_path, env, unset_env = self._materialize_profile(
                 options, resolved
             )
-            environment = _effective_options_env(options)
-            reuse_data_dir = environment.get(
-                "AGENTFIELD_OPENCODE_REUSE_DATA_DIR", "false"
-            ).strip().lower() in ("1", "true", "yes")
-            if reuse_data_dir:
-                if type(self)._shared_data_dir is None or not os.path.isdir(
-                    type(self)._shared_data_dir or ""
-                ):
-                    type(self)._shared_data_dir = tempfile.mkdtemp(
-                        prefix=".secaf-opencode-data-shared-"
-                    )
-                data_dir = type(self)._shared_data_dir
-            else:
-                temp_data_dir = tempfile.mkdtemp(prefix=".secaf-opencode-data-")
-                data_dir = temp_data_dir
+            # Profile-managed runs never reuse OpenCode's data/session store.
+            # Reuse would allow one profile run to observe another run's
+            # session state or cached credentials, even when config files are
+            # isolated.
+            temp_data_dir = tempfile.mkdtemp(prefix=".secaf-opencode-data-")
+            data_dir = temp_data_dir
             assert data_dir is not None
             env["XDG_DATA_HOME"] = data_dir
 
@@ -1573,14 +1676,16 @@ class OpenCodeProvider:
             profile_model = resolved.agent.get("model")
             if not isinstance(profile_model, str) or not profile_model.strip():
                 profile_model = resolved.base_config.get("model")
-            if not isinstance(options.get("model"), str) or not str(
-                options.get("model")
-            ).strip():
+            if (
+                not isinstance(options.get("model"), str)
+                or not str(options.get("model")).strip()
+            ):
                 if isinstance(profile_model, str) and profile_model.strip():
                     profile_options["model"] = profile_model
-            if not isinstance(options.get("variant"), str) or not str(
-                options.get("variant")
-            ).strip():
+            if (
+                not isinstance(options.get("variant"), str)
+                or not str(options.get("variant")).strip()
+            ):
                 profile_variant = resolved.agent.get("variant")
                 if isinstance(profile_variant, str) and profile_variant.strip():
                     profile_options["variant"] = profile_variant
@@ -1616,6 +1721,7 @@ class OpenCodeProvider:
             # Keep the legacy provider's process-cwd behavior: the project
             # root is selected with --dir, not by changing subprocess cwd.
             await self._ensure_profile_capabilities(env, unset_env, None)
+            environment = _effective_options_env(options)
             timeout_seconds = int(
                 environment.get("AGENTFIELD_HARNESS_TIMEOUT_SECONDS", "1800")
             )
@@ -1663,7 +1769,11 @@ class OpenCodeProvider:
                 raise cleanup_error
 
     async def _execute_impl(self, prompt: str, options: dict[str, object]) -> RawResult:
-        if _profile_management_requested(options):
+        if _profile_management_requested(
+            options,
+            profile_registry=self._profile_registry,
+            profile_file=self._profile_file,
+        ):
             return await self._execute_profile_impl(prompt, options)
 
         # opencode v1.4+ uses the `run` subcommand (replaces deprecated -p/-c flags)

@@ -11,15 +11,21 @@ from __future__ import annotations
 import inspect
 from collections.abc import Mapping
 
-from agentfield.exceptions import HarnessProfileUnsupportedError
+from agentfield.exceptions import (
+    HarnessProfileResolutionError,
+    HarnessProfileUnsupportedError,
+)
 from agentfield.types import ProfileId
 
 
 def normalize_profile(value: object) -> ProfileId | None:
-    """Return a non-empty profile identifier, preserving its opaque value.
+    """Classify a value for mode detection without raising.
 
-    Empty and whitespace-only values are intentionally treated as the legacy
-    profileless path.  No provider-specific normalization is performed.
+    Invalid values return ``None`` here because this helper is also used when
+    deciding whether an absent profile should keep the legacy path. Explicit
+    public inputs must go through :func:`validate_profile_id`, which rejects
+    invalid values instead of silently selecting profileless execution. No
+    provider-specific normalization is performed.
     """
 
     if value is None:
@@ -31,12 +37,45 @@ def normalize_profile(value: object) -> ProfileId | None:
     return ProfileId(value)
 
 
-def reject_profile_for_provider(
-    provider: str, options: Mapping[str, object]
-) -> None:
+def validate_profile_id(
+    value: object,
+    *,
+    provider: str,
+    required: bool = False,
+) -> ProfileId | None:
+    """Validate a caller-supplied opaque profile identifier.
+
+    ``normalize_profile`` is useful for detecting the legacy profileless path,
+    but it intentionally does not raise.  Public call paths must use this
+    helper as well so an explicitly supplied empty or non-string value cannot
+    quietly turn into a profileless run.
+    """
+
+    if value is None:
+        if required:
+            raise HarnessProfileResolutionError(
+                provider,
+                code="profile_missing",
+                message="profile-managed mode did not receive a profile",
+                action="provide a non-empty opaque profile identifier",
+            )
+        return None
+
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
+        raise HarnessProfileResolutionError(
+            provider,
+            code="profile_id_invalid",
+            message="the profile identifier must be a non-empty string",
+            action="provide a non-empty string profile identifier without NUL bytes",
+        )
+
+    return ProfileId(value)
+
+
+def reject_profile_for_provider(provider: str, options: Mapping[str, object]) -> None:
     """Reject a non-empty profile unless the provider implements validation."""
 
-    profile = normalize_profile(options.get("profile"))
+    profile = validate_profile_id(options.get("profile"), provider=provider)
     if profile is not None:
         raise HarnessProfileUnsupportedError(
             provider,
@@ -65,7 +104,7 @@ async def validate_provider_profile(
     """
 
     validator = getattr(provider, "validate_profile", None)
-    profile = normalize_profile(options.get("profile"))
+    profile = validate_profile_id(options.get("profile"), provider=provider_name)
     mode_checker = getattr(provider, "profile_mode_requested", None)
     managed = profile is not None or (
         callable(mode_checker) and bool(mode_checker(options))
@@ -103,6 +142,7 @@ async def validate_provider_profile(
 
 __all__ = [
     "normalize_profile",
+    "validate_profile_id",
     "reject_profile_for_provider",
     "validate_provider_profile",
 ]

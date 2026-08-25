@@ -69,7 +69,14 @@ jobs:
             go version
             uv --version
             [ "$(uv python dir)" = /data/uv/python ]
-            opencode --version
+            [ "$(opencode --version)" = 1.18.21 ]
+            opencode_help="$(opencode run --help)"
+            for flag in --agent --format --dir --model --variant; do
+              case "$opencode_help" in
+                *"$flag"*) ;;
+                *) echo "OpenCode run surface is missing $flag" >&2; exit 1 ;;
+              esac
+            done
           '
 
   # Summary job that depends on all critical checks
