@@ -45,66 +45,168 @@ _AGENTFIELD_WORKER_INSTRUCTION = (
     "Do not invoke AgentField orchestration, the `af` CLI, `swe-planner.plan`, "
     "or delegate work back to AgentField."
 )
-_AGENTFIELD_TOOL_ACTIONS = {
-    "read": "read",
-    "write": "edit",
-    "edit": "edit",
-    "glob": "glob",
-    "grep": "grep",
-    "bash": "bash",
-}
+_OPENCODE_INLINE_SYSTEM_PROMPT_ENV = "AGENTFIELD_OPENCODE_INLINE_SYSTEM_PROMPT"
+_TRUE_ENV_VALUES = frozenset(("1", "true", "yes", "on"))
 
 
-def _opencode_permissions(tools: object) -> dict[str, object]:
-    """Build the initial headless permission baseline for the harness agent.
+def _opencode_permissions() -> dict[str, object]:
+    """Build the fixed headless permission baseline for the harness agent.
 
-    The wildcard allow is intentional: this first integration preserves the
-    existing compatibility behavior instead of turning omitted tools into
-    denials. Recognized AgentField tools are also emitted under their OpenCode
-    action names so the translation remains visible in the effective config.
-    The skill rule is narrower than disabling skills entirely: it prevents an
-    AgentField-launched worker from loading AgentField orchestration skills
-    while leaving unrelated user and project skills available. OpenCode uses
-    the last matching rule, so this rule must follow the wildcard allow.
+    The wildcard allow preserves the existing compatibility behavior. The
+    AgentField skill rule is narrower than disabling skills entirely: it
+    prevents an AgentField-launched worker from loading AgentField
+    orchestration skills while leaving unrelated user and project skills
+    available. OpenCode uses the last matching rule, so this rule follows the
+    wildcard allow. HarnessConfig.tools and permission_mode are intentionally
+    not translated until OpenCode has a strict per-tool authorization mode.
     """
-    permissions: dict[str, object] = {"*": "allow"}
-    if isinstance(tools, (list, tuple, set, frozenset)):
-        for tool in tools:
-            if not isinstance(tool, str):
-                continue
-            action = _AGENTFIELD_TOOL_ACTIONS.get(tool.strip().lower())
-            if action is not None:
-                permissions[action] = "allow"
-
     # Headless runs must never wait for an interactive response. Keep this
-    # baseline independent of permission_mode: structured-output runs write
-    # .agentfield_output.json, so AgentField Write/Edit must retain OpenCode's
-    # edit permission. In particular, do not add an "ask" rule here.
-    permissions["skill"] = {"agentfield*": "deny"}
-    permissions["question"] = "deny"
-    permissions["task"] = "deny"
-    return permissions
+    # baseline independent of permission_mode: question and task are always
+    # denied, while the wildcard keeps the current permissive tool behavior.
+    return {
+        "*": "allow",
+        "skill": {"agentfield*": "deny"},
+        "question": "deny",
+        "task": "deny",
+    }
+
+
+def _agent_system_prompt(options: dict[str, object]) -> str:
+    system_prompt = options.get("system_prompt")
+    caller_prompt = system_prompt.strip() if isinstance(system_prompt, str) else ""
+    return (
+        f"{caller_prompt}\n\n{_AGENTFIELD_WORKER_INSTRUCTION}"
+        if caller_prompt
+        else _AGENTFIELD_WORKER_INSTRUCTION
+    )
+
+
+def _inline_system_prompt_enabled(options: dict[str, object]) -> bool:
+    env_value = options.get("env")
+    if isinstance(env_value, dict) and _OPENCODE_INLINE_SYSTEM_PROMPT_ENV in env_value:
+        value = env_value[_OPENCODE_INLINE_SYSTEM_PROMPT_ENV]
+    else:
+        value = os.environ.get(_OPENCODE_INLINE_SYSTEM_PROMPT_ENV, "")
+    return isinstance(value, str) and value.strip().lower() in _TRUE_ENV_VALUES
+
+
+def _deep_merge_config(
+    base: dict[str, object], overlay: dict[str, object]
+) -> dict[str, object]:
+    """Merge nested OpenCode objects, with the generated overlay taking precedence."""
+    merged = dict(base)
+    for key, value in overlay.items():
+        existing = merged.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            merged[key] = _deep_merge_config(existing, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _normalize_agentfield_harness_config(
+    config: dict[str, object], *, strip_system_prompt: bool
+) -> None:
+    agents = config.get("agent")
+    selected_agent = (
+        agents.get(_OPENCODE_AGENT_NAME) if isinstance(agents, dict) else None
+    )
+    if not isinstance(selected_agent, dict):
+        return
+
+    if strip_system_prompt:
+        selected_agent.pop("prompt", None)
+
+    permission = selected_agent.get("permission")
+    if not isinstance(permission, dict):
+        return
+
+    # OpenCode evaluates the last matching rule. Keep the generated wildcard
+    # first, caller-specific rules in the middle, and AgentField's targeted
+    # denials last even when the caller already supplied permission entries.
+    ordered: dict[str, object] = {}
+    if "*" in permission:
+        ordered["*"] = permission["*"]
+    for key, value in permission.items():
+        if key not in {"*", "skill", "question", "task"}:
+            ordered[key] = value
+
+    if "skill" in permission:
+        skill = permission["skill"]
+        if isinstance(skill, dict):
+            ordered_skill = {
+                key: value for key, value in skill.items() if key != "agentfield*"
+            }
+            if "agentfield*" in skill:
+                ordered_skill["agentfield*"] = skill["agentfield*"]
+            ordered["skill"] = ordered_skill
+        else:
+            ordered["skill"] = skill
+    if "question" in permission:
+        ordered["question"] = permission["question"]
+    if "task" in permission:
+        ordered["task"] = permission["task"]
+    selected_agent["permission"] = ordered
+
+
+def _merge_opencode_config_content(
+    existing_content: Optional[str],
+    overlay_content: str,
+    *,
+    strip_system_prompt: bool = False,
+) -> str:
+    """Merge the AgentField overlay into caller-provided OpenCode JSON."""
+    if not existing_content or not existing_content.strip():
+        return overlay_content
+
+    try:
+        existing = json.loads(existing_content)
+        overlay = json.loads(overlay_content)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "OPENCODE_CONFIG_CONTENT must be valid JSON when supplied to the "
+            "AgentField OpenCode provider"
+        ) from exc
+
+    if not isinstance(existing, dict):
+        raise ValueError(
+            "OPENCODE_CONFIG_CONTENT must contain a JSON object when supplied "
+            "to the AgentField OpenCode provider"
+        )
+    if not isinstance(overlay, dict):  # pragma: no cover - internal invariant
+        raise ValueError("AgentField OpenCode overlay must contain a JSON object")
+
+    merged = _deep_merge_config(existing, overlay)
+    _normalize_agentfield_harness_config(
+        merged, strip_system_prompt=strip_system_prompt
+    )
+    return json.dumps(merged, ensure_ascii=False)
+
+
+def _inline_opencode_prompt(prompt: str, options: dict[str, object]) -> str:
+    return (
+        "SYSTEM INSTRUCTIONS:\n"
+        f"{_agent_system_prompt(options)}\n\n"
+        "---\n\n"
+        f"USER REQUEST:\n{prompt}"
+    )
 
 
 def _build_opencode_config_content(
     options: dict[str, object],
     model_value: Optional[str],
     variant_value: Optional[str],
+    *,
+    include_system_prompt: bool = True,
 ) -> str:
     """Serialize the per-run OpenCode agent overlay."""
     agent: dict[str, object] = {
         "mode": "primary",
         "steps": 500,
-        "permission": _opencode_permissions(options.get("tools")),
+        "permission": _opencode_permissions(),
     }
-
-    system_prompt = options.get("system_prompt")
-    caller_prompt = system_prompt.strip() if isinstance(system_prompt, str) else ""
-    agent["prompt"] = (
-        f"{caller_prompt}\n\n{_AGENTFIELD_WORKER_INSTRUCTION}"
-        if caller_prompt
-        else _AGENTFIELD_WORKER_INSTRUCTION
-    )
+    if include_system_prompt:
+        agent["prompt"] = _agent_system_prompt(options)
     if model_value:
         agent["model"] = model_value
     if variant_value:
@@ -295,7 +397,10 @@ class OpenCodeProvider:
         cmd.extend(["--format", "json"])
 
         # Select a deterministic per-run agent. Its configuration is supplied
-        # through OPENCODE_CONFIG_CONTENT below rather than a shared file.
+        # through OPENCODE_CONFIG_CONTENT below rather than a shared file. The
+        # inline opt-out changes only the system-prompt transport so the same
+        # targeted permissions and model settings remain active.
+        inline_system_prompt = _inline_system_prompt_enabled(options)
         cmd.extend(["--agent", _OPENCODE_AGENT_NAME])
 
         # --dir is the project root the agent may read and write. project_dir is
@@ -323,12 +428,6 @@ class OpenCodeProvider:
         # response. opencode in non-TTY mode proceeds without permission
         # prompting, so no flag is needed. See agentfield#582.
 
-        # The system prompt belongs to the selected agent, so the task remains
-        # the only user-facing prompt sent to OpenCode.
-        prompt_via_stdin = _prompt_via_stdin()
-        if not prompt_via_stdin:
-            cmd.append(prompt)
-
         env: Dict[str, str] = {}
         env_value = options.get("env")
         if isinstance(env_value, dict):
@@ -338,12 +437,37 @@ class OpenCodeProvider:
                 if isinstance(key, str) and isinstance(value, str)
             }
 
-        # Model is passed via -m flag on the run subcommand (see above).
-        # Keep credentials and other caller-provided environment values in
-        # place; only the generated config content is added for this child.
-        env["OPENCODE_CONFIG_CONTENT"] = _build_opencode_config_content(
-            options, model_value, variant_value
+        # Keep caller credentials and configuration in place. The per-call
+        # value follows normal subprocess precedence over the ambient one; the
+        # generated harness overlay is then merged into that value. Inline mode
+        # removes the selected agent's configured prompt after merging so the
+        # system instructions travel through the legacy prompt path instead.
+        existing_config = env.get("OPENCODE_CONFIG_CONTENT")
+        if existing_config is None:
+            existing_config = os.environ.get("OPENCODE_CONFIG_CONTENT")
+        env["OPENCODE_CONFIG_CONTENT"] = _merge_opencode_config_content(
+            existing_config,
+            _build_opencode_config_content(
+                options,
+                model_value,
+                variant_value,
+                include_system_prompt=not inline_system_prompt,
+            ),
+            strip_system_prompt=inline_system_prompt,
         )
+
+        if inline_system_prompt:
+            # The fixed AgentField instruction remains present in this
+            # compatibility and rollback path.
+            effective_prompt = _inline_opencode_prompt(prompt, options)
+        else:
+            # The system prompt belongs to the selected agent, so the task
+            # remains the only user-facing prompt sent to OpenCode.
+            effective_prompt = prompt
+
+        prompt_via_stdin = _prompt_via_stdin()
+        if not prompt_via_stdin:
+            cmd.append(effective_prompt)
 
         cwd: Optional[str] = None
 
@@ -390,7 +514,7 @@ class OpenCodeProvider:
                     env=env,
                     cwd=cwd,
                     timeout=timeout_seconds,
-                    input_text=prompt if prompt_via_stdin else None,
+                    input_text=effective_prompt if prompt_via_stdin else None,
                 )
             except FileNotFoundError as exc:
                 raise provider_unavailable("opencode", self._bin) from exc
@@ -468,7 +592,7 @@ class OpenCodeProvider:
         else:
             estimated_cost = estimate_cli_cost(
                 model=model_value or "",
-                prompt=prompt,
+                prompt=effective_prompt,
                 result_text=result_text,
             )
 
