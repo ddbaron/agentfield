@@ -159,20 +159,25 @@ overlay sets `$schema` to `https://opencode.ai/config.json`, selects
 `agentfield-harness` as the default agent, and fixes its mode to `primary` with
 `steps` set to `500`. It does not modify shared OpenCode configuration files.
 
-A non-blank `system_prompt`, the resolved base `model`, and
-`reasoningEffort` are included in the agent overlay only when available. The
-base model is also passed with `-m`; a resolved variant is passed exactly once
-with `--variant`. An explicit `variant` wins over a `#variant` model suffix.
-AgentField `max_turns` remains a runner limit and is not serialized as
+A fixed worker instruction is always included in the agent overlay. When a
+caller supplies a non-blank `system_prompt`, it precedes that instruction. The
+resolved base `model` and `reasoningEffort` are included only when available.
+The base model is also passed with `-m`; a resolved variant is passed exactly
+once with `--variant`. An explicit `variant` wins over a `#variant` model
+suffix. AgentField `max_turns` remains a runner limit and is not serialized as
 OpenCode `steps`.
 
 OpenCode's initial permission baseline is headless and compatibility-oriented:
 the wildcard action is allowed, while AgentField `Read`, `Write`/`Edit`,
 `Glob`, `Grep`, and `Bash` map to OpenCode `read`, `edit`, `glob`, `grep`, and
-`bash`. Only `question` and `task` are explicitly denied, and no `ask`
-permission is generated. Omitted tools are not denied; this baseline is not
-per-role authorization. `Write`/`Edit` retain `edit` access because
-schema-constrained runs write their result file.
+`bash`. The wildcard action is followed by a resource-specific `skill` denial for
+`agentfield*`, which prevents the child from loading AgentField orchestration
+skills while leaving unrelated skills available. OpenCode evaluates the last
+matching permission rule, so this ordering is intentional. `question` and
+`task` are also explicitly denied, and no `ask` permission is generated.
+Omitted tools are not denied; this baseline is not per-role authorization.
+`Write`/`Edit` retain `edit` access because schema-constrained runs write their
+result file.
 
 The task prompt (including the runner's schema instructions, when applicable)
 is the only prompt sent to OpenCode: it is positional on POSIX and is the sole

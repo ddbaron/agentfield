@@ -80,9 +80,15 @@ async def test_opencode_provider_constructs_command_and_maps_result(
         "steps": 500,
         "permission": {
             "*": "allow",
+            "skill": {"agentfield*": "deny"},
             "question": "deny",
             "task": "deny",
         },
+        "prompt": (
+            "You are an AgentField-launched worker. Complete the assigned prompt directly. "
+            "Do not invoke AgentField orchestration, the `af` CLI, `swe-planner.plan`, "
+            "or delegate work back to AgentField."
+        ),
     }
     # Note: cwd is None because we use --dir in command instead of cwd param
     assert raw.is_error is False
@@ -127,7 +133,9 @@ async def test_opencode_overlay_configures_agent_tools_and_run_options(
     assert overlay["default_agent"] == "agentfield-harness"
     assert agent["mode"] == "primary"
     assert agent["steps"] == 500
-    assert agent["prompt"] == "Work autonomously."
+    assert agent["prompt"].startswith("Work autonomously.\n\n")
+    assert "Do not invoke AgentField orchestration" in agent["prompt"]
+    assert "the `af` CLI" in agent["prompt"]
     assert agent["model"] == "openai/gpt-5"
     assert agent["reasoningEffort"] == "max"
     assert agent["permission"] == {
@@ -137,9 +145,13 @@ async def test_opencode_overlay_configures_agent_tools_and_run_options(
         "glob": "allow",
         "grep": "allow",
         "bash": "allow",
+        "skill": {"agentfield*": "deny"},
         "question": "deny",
         "task": "deny",
     }
+    permission_keys = list(agent["permission"])
+    assert permission_keys.index("*") < permission_keys.index("skill")
+    assert agent["permission"]["skill"] == {"agentfield*": "deny"}
     assert "ask" not in agent["permission"]
     assert "max_turns" not in agent
 

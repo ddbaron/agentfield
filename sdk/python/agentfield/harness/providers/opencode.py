@@ -40,6 +40,11 @@ _OPENCODE_STDERR_ERROR_PATTERNS = (
 
 _OPENCODE_CONFIG_SCHEMA = "https://opencode.ai/config.json"
 _OPENCODE_AGENT_NAME = "agentfield-harness"
+_AGENTFIELD_WORKER_INSTRUCTION = (
+    "You are an AgentField-launched worker. Complete the assigned prompt directly. "
+    "Do not invoke AgentField orchestration, the `af` CLI, `swe-planner.plan`, "
+    "or delegate work back to AgentField."
+)
 _AGENTFIELD_TOOL_ACTIONS = {
     "read": "read",
     "write": "edit",
@@ -50,15 +55,19 @@ _AGENTFIELD_TOOL_ACTIONS = {
 }
 
 
-def _opencode_permissions(tools: object) -> dict[str, str]:
+def _opencode_permissions(tools: object) -> dict[str, object]:
     """Build the initial headless permission baseline for the harness agent.
 
     The wildcard allow is intentional: this first integration preserves the
     existing compatibility behavior instead of turning omitted tools into
     denials. Recognized AgentField tools are also emitted under their OpenCode
     action names so the translation remains visible in the effective config.
+    The skill rule is narrower than disabling skills entirely: it prevents an
+    AgentField-launched worker from loading AgentField orchestration skills
+    while leaving unrelated user and project skills available. OpenCode uses
+    the last matching rule, so this rule must follow the wildcard allow.
     """
-    permissions: dict[str, str] = {"*": "allow"}
+    permissions: dict[str, object] = {"*": "allow"}
     if isinstance(tools, (list, tuple, set, frozenset)):
         for tool in tools:
             if not isinstance(tool, str):
@@ -71,6 +80,7 @@ def _opencode_permissions(tools: object) -> dict[str, str]:
     # baseline independent of permission_mode: structured-output runs write
     # .agentfield_output.json, so AgentField Write/Edit must retain OpenCode's
     # edit permission. In particular, do not add an "ask" rule here.
+    permissions["skill"] = {"agentfield*": "deny"}
     permissions["question"] = "deny"
     permissions["task"] = "deny"
     return permissions
@@ -89,8 +99,12 @@ def _build_opencode_config_content(
     }
 
     system_prompt = options.get("system_prompt")
-    if isinstance(system_prompt, str) and system_prompt.strip():
-        agent["prompt"] = system_prompt.strip()
+    caller_prompt = system_prompt.strip() if isinstance(system_prompt, str) else ""
+    agent["prompt"] = (
+        f"{caller_prompt}\n\n{_AGENTFIELD_WORKER_INSTRUCTION}"
+        if caller_prompt
+        else _AGENTFIELD_WORKER_INSTRUCTION
+    )
     if model_value:
         agent["model"] = model_value
     if variant_value:
