@@ -391,6 +391,7 @@ Two examples already run at this load. The [deep-research engine](https://agentf
 | Tool access control | `tools=["Read", "Write", "Bash"]` |
 | Environment injection | `env={"KEY": "value"}` |
 | System prompt override | `system_prompt="..."` |
+| Provider-agnostic reasoning variants | `variant="high"` or a `#high` model suffix |
 | Multi-layer output recovery | Cosmetic repair → retry → full retry |
 
 #### Connector API (Fleet Management)
