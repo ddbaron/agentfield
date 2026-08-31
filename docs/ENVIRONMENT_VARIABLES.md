@@ -165,6 +165,8 @@ The same concept applies to **Docker**:
 
 Many Python examples also require model provider credentials (for example `OPENAI_API_KEY`), depending on the `AIConfig` you choose.
 
+Python OpenCode harness runs use the generated per-run agent configuration by default. Set `AGENTFIELD_OPENCODE_INLINE_SYSTEM_PROMPT=1` to opt into the legacy inline system-prompt transport for rollback or compatibility testing. This does not change authentication handling or add credentials to the prompt.
+
 ### MiniMax video generation
 
 - `MINIMAX_API_KEY`: API key used by the Python SDK's MiniMax media provider.
