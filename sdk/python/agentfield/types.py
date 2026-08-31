@@ -296,13 +296,6 @@ class HarnessConfig(BaseModel):
             "(aforge picks its own; claude-code uses sonnet)."
         ),
     )
-    variant: Optional[str] = Field(
-        default=None,
-        description=(
-            "Provider-specific reasoning-effort variant (for example, "
-            '"high" or "minimal"). Wins over a #variant model suffix.'
-        ),
-    )
     max_turns: int = Field(default=30, description="Maximum agent iterations.")
     max_budget_usd: Optional[float] = Field(
         default=None, description="Cost cap in USD."
@@ -346,7 +339,9 @@ class HarnessConfig(BaseModel):
         default="opencode", description="Path to opencode binary."
     )
     aforge_bin: str = Field(default="aforge", description="Path to aforge binary.")
-    grok_bin: str = Field(default="grok", description="Path to Grok Build CLI binary.")
+    grok_bin: str = Field(
+        default="grok", description="Path to Grok Build CLI binary."
+    )
     schema_mode: str = Field(
         default="single",
         description=(

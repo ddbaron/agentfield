@@ -133,10 +133,7 @@ result = await app.harness(
 )
 ```
 
-An explicit `variant="high"` keyword wins over the suffix. In Python,
-`variant` is also available on `HarnessConfig` and `HarnessRunner.run`; a
-per-call `Agent.harness(..., variant=...)` value overrides the configured
-default. Per provider:
+An explicit `variant="high"` keyword wins over the suffix. Per provider:
 
 | Provider | Model flag | Variant handling |
 | --- | --- | --- |
@@ -171,10 +168,9 @@ A fixed worker instruction is always included, in the default agent overlay
 or in the inline prompt when the rollback is enabled. When a caller supplies a
 non-blank `system_prompt`, it precedes that instruction. The resolved base
 `model` and `reasoningEffort` are included only when available.
-The base model is also passed with `-m`; a resolved variant is passed exactly
-once with `--variant`. An explicit `variant` wins over a `#variant` model
-suffix. AgentField `max_turns` remains a runner limit and is not serialized as
-OpenCode `steps`.
+The base model is also passed with `-m`; a resolved `#variant` suffix is
+passed exactly once with `--variant`. AgentField `max_turns` remains a runner
+limit and is not serialized as OpenCode `steps`.
 
 OpenCode's initial permission baseline is headless and compatibility-oriented:
 the wildcard action is allowed. It is followed by a resource-specific `skill`

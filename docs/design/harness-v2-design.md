@@ -98,7 +98,6 @@ fix = await app.harness(
     "Refactor to async/await",
     provider="codex",      # Override default provider
     model="o3",            # Override default model
-    variant="high",        # Provider-specific reasoning effort
     max_turns=100,
     tools=["Read", "Write", "Edit", "Bash"],
     max_budget_usd=5.0,
@@ -140,7 +139,7 @@ async def fix_issue(issue: dict) -> dict:
 
 ### 3.1 System Diagram
 
-```text
+```
 Agent
 ├── .ai()      → AIConfig      → LiteLLM     → LLM APIs (100+ providers)
 └── .harness() → HarnessConfig → HarnessRunner → Provider → {Aforge, Claude Code, Codex, Gemini, OpenCode}
@@ -148,7 +147,7 @@ Agent
 
 ### 3.2 Component Stack
 
-```text
+```
 ┌──────────────────────────────────────────────────────────────┐
 │                    Agent.harness()                            │
 │          HarnessConfig (constructor param, optional)          │
@@ -261,13 +260,12 @@ type Provider interface {
 **Core principle**: Always instruct the coding agent to write JSON output to a file using its Write tool. Never rely on native `--json-schema` / `--output-schema` flags as the primary mechanism.
 
 **Why file-write over native flags:**
-
 - Native flags constrain the model's *text response* — a wrong abstraction for multi-turn coding agents whose core competency is writing files
 - Large schemas can produce JSON that exceeds response token limits or gets truncated
 - File-write works identically across ALL 4 providers (one code path, half the tests)
 - Writing a JSON file is trivially easy for agents that refactor entire codebases
 
-```text
+```
 Developer writes:  await app.harness("...", schema=MyModel)
 
 Runner (ALL providers):
@@ -279,7 +277,7 @@ Runner (ALL providers):
 
 ### 5.2 Output File Convention
 
-```text
+```
 {cwd}/.agentfield_output.json
 ```
 
@@ -291,7 +289,7 @@ Runner (ALL providers):
 
 Appended to the **end** of the user prompt (recency bias — models weight the end of input most heavily). OpenCode's Python adapter configures a non-blank system prompt through its per-run `OPENCODE_CONFIG_CONTENT` agent overlay by default; `AGENTFIELD_OPENCODE_INLINE_SYSTEM_PROMPT=1` is an opt-in compatibility rollback that transports it inline. Other CLI wrappers may not expose system prompt control. See [the provider contract](../harness-providers.md#opencode-standalone-runs-python) for the OpenCode-specific behavior.
 
-```text
+```
 {user's actual task prompt}
 
 ---
@@ -308,7 +306,7 @@ Do not include any text outside the JSON in that file. Do not wrap in markdown f
 
 On schema validation failure, recover cheapest-first:
 
-```text
+```
 Layer 1: Parse file → validate against schema           (happy path, no cost)
     ↓ fail
 Layer 2: Cosmetic repair → re-validate                  (zero cost)
@@ -358,7 +356,6 @@ class HarnessConfig(BaseModel):
     # Provider selection: explicit > AGENTFIELD_HARNESS_PROVIDER > "aforge"
     provider: str = "aforge"    # | "claude-code" | "codex" | "gemini" | "opencode"
     model: Optional[str] = None  # None → the provider's own default
-    variant: Optional[str] = None  # Explicit reasoning-effort variant
     
     # Execution limits
     max_turns: int = 30
@@ -425,7 +422,7 @@ interface HarnessConfig {
 
 ### 6.3 Config Resolution (hierarchical, matches .ai pattern)
 
-```text
+```
 1. HarnessConfig defaults (set at agent construction)
 2. Per-call overrides (passed to .harness() method)
    → Per-call values win over HarnessConfig defaults
@@ -503,7 +500,7 @@ class Metrics:
 
 ### 8.1 Python SDK
 
-```text
+```
 sdk/python/agentfield/harness/
 ├── __init__.py              # Public API: AgentHarness, HarnessConfig, HarnessResult
 ├── _handler.py              # AgentHarness class (attached to Agent, like AgentAI)
@@ -523,7 +520,7 @@ sdk/python/agentfield/harness/
 
 ### 8.2 TypeScript SDK
 
-```text
+```
 sdk/typescript/src/harness/
 ├── index.ts                 # Public API exports
 ├── handler.ts               # Agent integration (like AIClient)
@@ -543,7 +540,7 @@ sdk/typescript/src/harness/
 
 ### 8.3 Go SDK (future)
 
-```text
+```
 sdk/go/harness/
 ├── config.go                # Config struct
 ├── runner.go                # Runner (retry, schema, logging)
@@ -745,21 +742,18 @@ class GeminiProvider:
 ## 12. Testing Strategy
 
 ### Unit Tests
-
 - Runner: retry behavior, config resolution, schema orchestration
 - Schema: native flag generation, file-write suffix, JSON parsing, validation
 - Factory: provider routing for each provider name
 - Each provider: command construction, output parsing
 
 ### Integration Tests (mock subprocess)
-
 - Full flow: prompt → provider → parse → schema validate → return
 - Retry on transient errors
 - Schema failure → `is_error=True`
 - Cost/metrics extraction
 
 ### E2E Tests (optional, CI-gated)
-
 - Actual Claude Code call with schema
 - Actual Codex call with schema
 - Require API keys (skip in CI by default)
@@ -769,18 +763,15 @@ class GeminiProvider:
 ## 13. Dependencies
 
 ### Python SDK
-
 - `claude-agent-sdk` (optional — lazy import, only when claude-code provider used)
 - No new required dependencies (subprocess is stdlib)
 
 ### TypeScript SDK
-
 - `@anthropic-ai/claude-agent-sdk` (optional peer dependency)
 - `@openai/codex-sdk` (optional peer dependency)
 - `zod-to-json-schema` (already a dependency)
 
 ### Go SDK
-
 - No new dependencies (os/exec is stdlib)
 
 ---
