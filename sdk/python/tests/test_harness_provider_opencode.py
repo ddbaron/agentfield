@@ -262,6 +262,181 @@ async def test_opencode_overlay_merges_ambient_config(
 
 
 @pytest.mark.asyncio
+async def test_opencode_overlay_accepts_jsonc_config_and_preserves_nested_values(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, Any] = {}
+
+    async def fake_run_cli(cmd, *, env=None, cwd=None, timeout=None, input_text=None):
+        _ = cmd, cwd, timeout, input_text
+        captured["env"] = env
+        return "ok\n", "", 0
+
+    monkeypatch.setattr("agentfield.harness.providers.opencode.run_cli", fake_run_cli)
+    caller_config = r"""
+    {
+      // Strict JSON cannot express comments or trailing commas.
+      "$schema": "https://caller.invalid/opencode.jsonc",
+      "default_agent": "caller-agent",
+      /* Nested caller configuration must survive the overlay. */
+      "provider": {
+        "custom": {
+          "options": {
+            "baseURL": "https://example.invalid/api//keep",
+            "commentLike": "/* keep this string */",
+          },
+        },
+      },
+      "mcp": {
+        "local": {
+          "type": "local",
+          "command": [
+            "tool",
+            "// keep this array value",
+            "/* keep this array value */",
+          ],
+        },
+      },
+      "agent": {
+        "agentfield-harness": {
+          "mode": "secondary",
+          "steps": 1,
+          "nested": {
+            "array": ["preserve",],
+          },
+          "permission": {
+            "*": "deny",
+            "read": "deny",
+          },
+        },
+      },
+    }
+    """
+
+    await OpenCodeProvider().execute(
+        "hello",
+        {
+            "model": "openai/gpt-5",
+            "env": {"OPENCODE_CONFIG_CONTENT": caller_config},
+        },
+    )
+
+    serialized = captured["env"]["OPENCODE_CONFIG_CONTENT"]
+    merged = json.loads(serialized)
+    assert merged["$schema"] == "https://opencode.ai/config.json"
+    assert merged["default_agent"] == "agentfield-harness"
+    assert merged["provider"]["custom"]["options"] == {
+        "baseURL": "https://example.invalid/api//keep",
+        "commentLike": "/* keep this string */",
+    }
+    assert merged["mcp"]["local"]["command"] == [
+        "tool",
+        "// keep this array value",
+        "/* keep this array value */",
+    ]
+    generated_agent = merged["agent"]["agentfield-harness"]
+    assert generated_agent["mode"] == "primary"
+    assert generated_agent["steps"] == 500
+    assert generated_agent["model"] == "openai/gpt-5"
+    assert generated_agent["nested"] == {"array": ["preserve"]}
+    assert generated_agent["permission"] == {
+        "*": "allow",
+        "read": "deny",
+        "skill": {"agentfield*": "deny"},
+        "question": "deny",
+        "task": "deny",
+    }
+
+
+@pytest.mark.asyncio
+async def test_opencode_overlay_accepts_jsonc_ambient_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, Any] = {}
+
+    async def fake_run_cli(cmd, *, env=None, cwd=None, timeout=None, input_text=None):
+        _ = cmd, cwd, timeout, input_text
+        captured["env"] = env
+        return "ok\n", "", 0
+
+    monkeypatch.setattr("agentfield.harness.providers.opencode.run_cli", fake_run_cli)
+    monkeypatch.setenv(
+        "OPENCODE_CONFIG_CONTENT",
+        """
+        {
+          // The ambient value follows OpenCode's global opencode.jsonc shape.
+          "provider": {
+            "ambient": {
+              "options": {
+                "baseURL": "https://ambient.invalid//preserve",
+              },
+            },
+          },
+          "mcp": {
+            "ambient": {
+              "command": ["ambient-tool",],
+            },
+          },
+        }
+        """,
+    )
+
+    await OpenCodeProvider().execute("hello", {})
+
+    merged = json.loads(captured["env"]["OPENCODE_CONFIG_CONTENT"])
+    assert merged["provider"]["ambient"]["options"]["baseURL"] == (
+        "https://ambient.invalid//preserve"
+    )
+    assert merged["mcp"]["ambient"]["command"] == ["ambient-tool"]
+    assert merged["default_agent"] == "agentfield-harness"
+
+
+@pytest.mark.asyncio
+async def test_opencode_overlay_rejects_malformed_jsonc_without_echoing_secret(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    async def fake_run_cli(*_args, **_kwargs):
+        raise AssertionError("the subprocess must not start")
+
+    monkeypatch.setattr("agentfield.harness.providers.opencode.run_cli", fake_run_cli)
+    secret = "jsonc-secret-must-not-appear-in-errors"
+    malformed_config = f"""
+    {{
+      // The closing braces are intentionally missing.
+      "secret": "{secret}",
+      "provider": {{"value": 1,}},
+    """
+
+    with pytest.raises(ValueError) as exc_info:
+        await OpenCodeProvider().execute(
+            "hello",
+            {"env": {"OPENCODE_CONFIG_CONTENT": malformed_config}},
+        )
+
+    assert "OPENCODE_CONFIG_CONTENT must be valid JSON or JSONC" in str(exc_info.value)
+    assert secret not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_opencode_overlay_rejects_non_object_jsonc_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    async def fake_run_cli(*_args, **_kwargs):
+        raise AssertionError("the subprocess must not start")
+
+    monkeypatch.setattr("agentfield.harness.providers.opencode.run_cli", fake_run_cli)
+
+    with pytest.raises(
+        ValueError,
+        match="OPENCODE_CONFIG_CONTENT must contain a JSON object",
+    ):
+        await OpenCodeProvider().execute(
+            "hello",
+            {"env": {"OPENCODE_CONFIG_CONTENT": "[// comment\n 1,]"}},
+        )
+
+
+@pytest.mark.asyncio
 async def test_opencode_overlay_rejects_malformed_config(
     monkeypatch: pytest.MonkeyPatch,
 ):

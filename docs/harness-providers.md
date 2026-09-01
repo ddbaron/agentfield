@@ -158,11 +158,15 @@ overlay sets `$schema` to `https://opencode.ai/config.json`, selects
 
 The generated overlay is deep-merged into a caller-provided
 `OPENCODE_CONFIG_CONTENT` value, or into the ambient value when no per-call
-value is supplied. Unrelated providers, agents, MCP servers, and other
-configuration remain intact, while AgentField's generated harness fields take
-precedence where they overlap. The overlay contains no provider credentials or
-API keys. The supplied configuration must be a JSON object; malformed content
-is reported instead of being silently discarded.
+value is supplied. The inherited value may be strict JSON or OpenCode-compatible
+JSONC with line/block comments and trailing commas. It is parsed before the
+merge and emitted to OpenCode as strict JSON. Unrelated providers, agents, MCP
+servers, and other configuration remain intact, while AgentField's generated
+harness fields take precedence where they overlap. The overlay contains no
+provider credentials or API keys. The supplied configuration must be a JSON
+object; malformed content is reported instead of being silently discarded. This
+boundary applies to `OPENCODE_CONFIG_CONTENT`; the provider does not read or
+rewrite the global `opencode.jsonc` file.
 
 A fixed worker instruction is always included, in the default agent overlay
 or in the inline prompt when the rollback is enabled. When a caller supplies a

@@ -47,6 +47,10 @@ _AGENTFIELD_WORKER_INSTRUCTION = (
 )
 _OPENCODE_INLINE_SYSTEM_PROMPT_ENV = "AGENTFIELD_OPENCODE_INLINE_SYSTEM_PROMPT"
 _TRUE_ENV_VALUES = frozenset(("1", "true", "yes", "on"))
+_OPENCODE_CONFIG_CONTENT_ERROR = (
+    "OPENCODE_CONFIG_CONTENT must be valid JSON or JSONC when supplied to the "
+    "AgentField OpenCode provider"
+)
 
 
 def _opencode_permissions() -> dict[str, object]:
@@ -149,6 +153,26 @@ def _normalize_agentfield_harness_config(
     selected_agent["permission"] = ordered
 
 
+def _parse_opencode_config_content(content: str) -> dict[str, object]:
+    """Parse strict JSON first, then the JSONC subset OpenCode accepts."""
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        try:
+            import jsonc
+
+            parsed = jsonc.loads(content)
+        except (ImportError, ValueError) as exc:
+            raise ValueError(_OPENCODE_CONFIG_CONTENT_ERROR) from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            "OPENCODE_CONFIG_CONTENT must contain a JSON object when supplied "
+            "to the AgentField OpenCode provider"
+        )
+    return parsed
+
+
 def _merge_opencode_config_content(
     existing_content: Optional[str],
     overlay_content: str,
@@ -159,20 +183,12 @@ def _merge_opencode_config_content(
     if not existing_content or not existing_content.strip():
         return overlay_content
 
+    existing = _parse_opencode_config_content(existing_content)
     try:
-        existing = json.loads(existing_content)
         overlay = json.loads(overlay_content)
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            "OPENCODE_CONFIG_CONTENT must be valid JSON when supplied to the "
-            "AgentField OpenCode provider"
-        ) from exc
+    except json.JSONDecodeError as exc:  # pragma: no cover - internal invariant
+        raise ValueError("AgentField OpenCode overlay must contain valid JSON") from exc
 
-    if not isinstance(existing, dict):
-        raise ValueError(
-            "OPENCODE_CONFIG_CONTENT must contain a JSON object when supplied "
-            "to the AgentField OpenCode provider"
-        )
     if not isinstance(overlay, dict):  # pragma: no cover - internal invariant
         raise ValueError("AgentField OpenCode overlay must contain a JSON object")
 
@@ -180,7 +196,10 @@ def _merge_opencode_config_content(
     _normalize_agentfield_harness_config(
         merged, strip_system_prompt=strip_system_prompt
     )
-    return json.dumps(merged, ensure_ascii=False)
+    try:
+        return json.dumps(merged, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:  # pragma: no cover - parser invariant
+        raise ValueError(_OPENCODE_CONFIG_CONTENT_ERROR) from exc
 
 
 def _inline_opencode_prompt(prompt: str, options: dict[str, object]) -> str:
